@@ -146,6 +146,20 @@ def test_append_rejects_extra_columns(engine):
             "match_type": ["exact"], "tickr": ["A"]}))
 
 
+def test_arrow_schema_tracks_the_live_table_not_the_table_def(engine):
+    """Writers build batches from this, so it must follow schema evolution."""
+    from pyiceberg.types import StringType
+
+    td = schemas.SILVER_MERCHANT_MAP
+    engine.create_table(td)
+    assert engine.arrow_schema(td.name).names == td.schema.as_arrow().names
+
+    table = engine.catalog.load_table(td.name)
+    with table.update_schema() as update:
+        update.add_column("confidence_note", StringType())
+    assert "confidence_note" in engine.arrow_schema(td.name).names
+
+
 def test_every_table_definition_creates(engine):
     """All 12 schemas and partition specs must survive a real catalog commit."""
     for td in schemas.ALL_TABLES:

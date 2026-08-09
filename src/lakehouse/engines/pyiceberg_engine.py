@@ -31,6 +31,16 @@ class PyIcebergEngine:
         table = self.catalog.load_table(ident)
         table.overwrite(_conform(data, table.schema().as_arrow()))
 
+    def arrow_schema(self, ident: str) -> pa.Schema:
+        """The table's *live* Arrow schema. Metadata only, no data scan.
+
+        Writers must build batches against this rather than against the
+        authoring `TableDef`: once a table has been evolved the two differ,
+        and `append` rejects any column-set mismatch (deliberately -- see
+        `_conform`). Reading it from a scan would work but costs a full read.
+        """
+        return self.catalog.load_table(ident).schema().as_arrow()
+
     def scan_arrow(self, ident: str, snapshot_id: int | None = None) -> pa.Table:
         table = self.catalog.load_table(ident)
         scan = table.scan() if snapshot_id is None else table.scan(snapshot_id=snapshot_id)

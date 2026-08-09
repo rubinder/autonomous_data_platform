@@ -47,8 +47,8 @@ def add_lineage(
     return out
 
 
-def _to_arrow(records: list[dict], table_def: schemas.TableDef) -> pa.Table:
-    arrow_schema = table_def.schema.as_arrow()
+def _to_arrow(records: list[dict], arrow_schema: pa.Schema) -> pa.Table:
+    """Shape records to `arrow_schema`. Keys absent from a record become NULL."""
     return pa.Table.from_pylist(records, schema=arrow_schema)
 
 
@@ -71,7 +71,13 @@ def ingest_all(engine, n_transactions: int | None = None) -> dict[str, int]:
     ):
         engine.create_table(table_def)
         enriched = add_lineage(records, source)
-        engine.append(table_def.name, _to_arrow(enriched, table_def))
+        # Against the *live* schema, not the authoring one: a table that has
+        # been evolved (Task 16) has columns the source feed knows nothing
+        # about, and `append` rejects a column set that does not match the
+        # table exactly. Unknown columns land as NULL, which is the honest
+        # answer -- Bronze records what arrived, and nothing arrived for them.
+        engine.append(table_def.name,
+                      _to_arrow(enriched, engine.arrow_schema(table_def.name)))
         counts[table_def.name] = len(enriched)
 
     return counts
