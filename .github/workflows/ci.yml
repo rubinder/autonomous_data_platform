@@ -1,0 +1,46 @@
+name: ci
+
+# Lint, the full test suite, an end-to-end smoke build on a reduced dataset,
+# and an ops-agent dry run -- all on the pure-Python path (PyIceberg + DuckDB).
+# PySpark is not installed here, so the cross-engine parity tests skip cleanly;
+# that is the expected offline outcome, not a gap (see ADR-0002).
+#
+# HARD RULE: no step in this workflow may gate on a forecast-quality metric.
+# The smoke build runs at N_TRANSACTIONS=5000, where gold.daily_merchant_spend
+# covers only 1,532 of 3,756 ticker-days -- roughly 59% of training rows have
+# every spend feature NULL and the spend-target correlation collapses to
+# ~0.003. Any model-quality number computed at that scale is noise, and on
+# this dataset the model is *expected* to lose to its baseline at full scale
+# too (docs/forecast-report.md). A job that goes red when the model loses
+# teaches people to ignore CI. `make forecast` fails only when the pipeline
+# produced no predictions at all; that is the contract this workflow relies on.
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync --extra dev
+
+      - name: Lint
+        run: uv run ruff check src tests
+
+      - name: Tests
+        run: uv run pytest -v
+
+      - name: Smoke the full pipeline on a reduced dataset
+        run: N_TRANSACTIONS=5000 uv run make all
+
+      - name: Ops agent (dry-run, no API key -- rules-only path)
+        run: uv run make agent
+
+      - name: The smoke build must not modify tracked files
+        # `make all` regenerates docs/forecast-report.md, and at reduced scale
+        # it necessarily differs from the committed full-scale report -- so
+        # restore that one file, then require the rest of the tree to be
+        # untouched. Anything else the pipeline rewrote is a real finding.
+        run: |
+          git checkout -- docs/forecast-report.md
+          git diff --exit-code

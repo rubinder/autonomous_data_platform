@@ -6,10 +6,14 @@ name: monitors
 # empty delta has no nulls, no duplicates, and nothing out of range.
 #
 # Every step below gates on a genuine failure (a breach or a crash), never
-# on which forecast model won. At smoke scale (N_TRANSACTIONS=5000 here,
-# for a fast scheduled run) roughly 59% of training rows have every spend
-# feature NULL, so model skill is not a meaningful signal at this scale --
-# see docs/forecast-report.md's small-sample caveat. `make forecast`
+# on which forecast model won. The scheduled build runs reduced
+# (N_TRANSACTIONS=20000, for a fast run), and reduced scale starves the spend
+# features: at 5,000 transactions roughly 59% of training rows have every
+# spend feature NULL, and 20,000 is still far short of the 250,000 the
+# committed report was produced from. Model skill is therefore not a
+# meaningful signal here -- see docs/forecast-report.md's small-sample
+# caveat, and note that the model does not beat its baseline at full scale
+# either, so a skill gate would be permanently red. `make forecast`
 # already only fails when the pipeline produced no predictions at all, not
 # on model comparison, and the same rule holds here: this workflow must
 # never fail because the model "didn't win".
