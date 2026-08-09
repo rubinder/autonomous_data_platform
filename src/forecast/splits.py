@@ -23,7 +23,8 @@ class Fold:
 
 def purged_walk_forward(dates: Sequence[date], n_folds: int = 5,
                         purge: int = config.PURGE_DAYS,
-                        min_train: int = 120) -> list[Fold]:
+                        min_train: int = 120,
+                        min_test: int = 20) -> list[Fold]:
     n = len(dates)
     usable = n - min_train - purge
     if usable < n_folds * 2:
@@ -32,10 +33,17 @@ def purged_walk_forward(dates: Sequence[date], n_folds: int = 5,
             f"min_train={min_train} and purge={purge}")
 
     test_size = usable // n_folds
+    if test_size < min_test:
+        raise ValueError(
+            f"series of {n} points produces test_size={test_size}, "
+            f"but min_test={min_test} required (n_folds={n_folds}, "
+            f"min_train={min_train}, purge={purge})")
+
     folds: list[Fold] = []
     for i in range(n_folds):
         test_start = min_train + purge + i * test_size
         test_end = test_start + test_size if i < n_folds - 1 else n
+        # Invariant: gap == purge + 1 (strictly greater than the 5-day horizon)
         train_end = test_start - purge
         folds.append(Fold(
             index=i,
