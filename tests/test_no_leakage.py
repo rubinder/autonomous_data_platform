@@ -27,23 +27,65 @@ def built(tmp_path_factory):
 
 
 def test_every_feature_recomputes_from_data_at_or_before_t(built):
-    """The core guarantee. Recompute each feature using a truncated history."""
-    training, spend, prices = built
-    sample = training.dropna(subset=list(features.FEATURE_COLUMNS)).sample(
-        30, random_state=0)
+    """The core guarantee: EVERY row, EVERY feature, BOTH directions.
 
-    for _, row in sample.iterrows():
+    Not a sample, and not the dropna'd frame. Sampling 30 rows out of
+    `dropna(subset=FEATURE_COLUMNS)` is doubly blind: it misses most rows, and
+    it structurally cannot see a row where the SQL stored a value the
+    recomputation says is undefined -- which is the exact shape of a
+    partial-window warm-up bug. So null-ness is asserted as an equality too:
+    where one side is null the other must be null, and where both are present
+    they must agree to 1e-6.
+    """
+    training, spend, prices = built
+    spend_by = {t: g for t, g in spend.groupby("ticker")}
+    prices_by = {t: g for t, g in prices.groupby("ticker")}
+    checked = 0
+    worst = 0.0
+
+    for _, row in training.iterrows():
         as_of = row["trade_date"]
         ticker = row["ticker"]
-        spend_hist = spend[(spend["ticker"] == ticker) & (spend["spend_date"] <= as_of)]
-        price_hist = prices[(prices["ticker"] == ticker) & (prices["trade_date"] <= as_of)]
+        sh = spend_by[ticker]
+        ph = prices_by[ticker]
+        spend_hist = sh[sh["spend_date"] <= as_of]
+        price_hist = ph[ph["trade_date"] <= as_of]
         recomputed = features.recompute_row(spend_hist, price_hist, ticker, as_of)
         for col in features.FEATURE_COLUMNS:
             expected, actual = recomputed[col], row[col]
-            if pd.isna(expected) and pd.isna(actual):
+            checked += 1
+            assert pd.isna(expected) == pd.isna(actual), (
+                f"{ticker} {as_of} {col}: stored {actual} is null-mismatched against "
+                f"recomputed-from-past {expected}")
+            if pd.isna(expected):
                 continue
+            worst = max(worst, abs(expected - actual))
             assert abs(expected - actual) < 1e-6, (
                 f"{ticker} {as_of} {col}: stored {actual} != recomputed-from-past {expected}")
+
+    assert checked == len(training) * len(features.FEATURE_COLUMNS)
+    assert worst < 1e-6, f"largest discrepancy {worst:.3e}"
+
+
+def test_recompute_row_rejects_history_reaching_past_as_of(built):
+    """The truncation contract is the caller's job, so recompute_row polices it."""
+    _, spend, prices = built
+    as_of = sorted(prices[prices["ticker"] == "CMG"]["trade_date"])[100]
+    sh = spend[(spend["ticker"] == "CMG") & (spend["spend_date"] <= as_of)]
+    ph = prices[prices["ticker"] == "CMG"]  # NOT truncated: reaches into the future
+
+    with pytest.raises(ValueError, match="looks past as_of"):
+        features.recompute_row(sh, ph, "CMG", as_of)
+
+
+def test_recompute_row_rejects_another_tickers_history(built):
+    _, spend, prices = built
+    as_of = sorted(prices[prices["ticker"] == "CMG"]["trade_date"])[100]
+    sh = spend[spend["spend_date"] <= as_of]  # every ticker, not just CMG
+    ph = prices[(prices["ticker"] == "CMG") & (prices["trade_date"] <= as_of)]
+
+    with pytest.raises(ValueError, match="contains other tickers"):
+        features.recompute_row(sh, ph, "CMG", as_of)
 
 
 def test_target_looks_forward_exactly_five_trading_days(built):

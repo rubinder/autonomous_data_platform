@@ -11,21 +11,34 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
-FEATURE_COLUMNS: tuple[str, ...] = (
+SPEND_FEATURES: tuple[str, ...] = (
     "spend_mom_7d", "spend_z_28d", "txn_count_z_28d", "avg_ticket_delta_7d",
     "unique_acct_growth_7d", "spend_surprise",
+)
+PRICE_FEATURES: tuple[str, ...] = (
     "ret_lag_1", "ret_lag_2", "ret_lag_3", "ret_lag_4", "ret_lag_5",
     "realized_vol_21d", "rsi_14", "volume_z_21d",
 )
+FEATURE_COLUMNS: tuple[str, ...] = SPEND_FEATURES + PRICE_FEATURES
 TARGET = "fwd_ret_5d"
 
 
 def recompute_row(spend_hist: pd.DataFrame, price_hist: pd.DataFrame,
                   ticker: str, as_of: date) -> dict[str, float]:
     """Recompute every feature for (ticker, as_of) from history <= as_of only."""
+    _assert_truncated(spend_hist, "spend_date", ticker, as_of)
+    _assert_truncated(price_hist, "trade_date", ticker, as_of)
     s = spend_hist.sort_values("spend_date").reset_index(drop=True)
     p = price_hist.sort_values("trade_date").reset_index(drop=True)
     out: dict[str, float] = {}
+
+    # Every spend frame is a ROWS window anchored on the row dated `as_of`, so
+    # with no such row the whole family is undefined -- which is exactly what
+    # TRAINING_SQL's LEFT JOIN yields on a day with no matched transactions.
+    # Falling through to the last *available* row instead would quietly date
+    # the feature to some earlier day and call it today's.
+    if not (len(s) and s["spend_date"].iloc[-1] == as_of):
+        return dict.fromkeys(SPEND_FEATURES, np.nan) | _price_features(p)
 
     gs = s["gross_spend"]
     out["spend_mom_7d"] = _safe(gs.tail(7).mean(), gs.tail(28).mean(), ratio=True)
@@ -45,12 +58,18 @@ def recompute_row(spend_hist: pd.DataFrame, price_hist: pd.DataFrame,
     out["spend_surprise"] = _safe(
         (gs.iloc[-1] - prior.mean()) if len(prior) else np.nan, sigma)
 
+    return out | _price_features(p)
+
+
+def _price_features(p: pd.DataFrame) -> dict[str, float]:
+    """The price half, from a history already truncated at as_of."""
+    out: dict[str, float] = {}
     # ret.iloc[-1] is the return *of* as_of -- lag 0 -- so lag k is iloc[-(k+1)].
     # gold.STOCK_FEATURES_SQL defines ret_lag_k as lag(ret_1d, k), the return of
     # day t-k, and keeps the unlagged one in its own column, `ret_1d`. Indexing
     # from -k instead would make ret_lag_1 today's return, colliding with that
     # column and shifting the whole family one day fresher. Verified against the
-    # mart: stored ret_lag_k equals ret_1d(t-k) to 1e-16 for every sampled row.
+    # mart: stored ret_lag_k equals ret_1d(t-k) to 1e-16 on every row.
     ret = p["close"].pct_change()
     for k in range(1, 6):
         out[f"ret_lag_{k}"] = ret.iloc[-(k + 1)] if len(ret) > k + 1 else np.nan
@@ -63,6 +82,26 @@ def recompute_row(spend_hist: pd.DataFrame, price_hist: pd.DataFrame,
     vol = p["volume"].astype(float)
     out["volume_z_21d"] = _z(vol, 21)
     return out
+
+
+def _assert_truncated(frame: pd.DataFrame, date_col: str,
+                      ticker: str, as_of: date) -> None:
+    """Defend the truncation contract the whole no-lookahead guarantee rests on.
+
+    The caller does the filtering, so a mis-filtered frame -- another ticker's
+    rows, or a single row dated after `as_of` -- would sail straight through and
+    the "independent recomputation" would be quietly recomputing from the
+    future. Silent there is the worst possible failure mode: the test would go
+    green while proving nothing. Raise instead of assert so `python -O` cannot
+    strip the check.
+    """
+    others = sorted(set(frame["ticker"].unique()) - {ticker})
+    if others:
+        raise ValueError(f"history for {ticker} contains other tickers: {others}")
+    if len(frame) and frame[date_col].max() > as_of:
+        raise ValueError(
+            f"history for {ticker} looks past as_of={as_of}: "
+            f"max {date_col} is {frame[date_col].max()}")
 
 
 def _z(series: pd.Series, window: int) -> float:
