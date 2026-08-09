@@ -275,11 +275,28 @@ GOLD_PREDICTIONS = TableDef(
     PartitionSpec(PartitionField(1, 1000, IdentityTransform(), "ticker")),
 )
 
+OPS_MONITOR_RESULTS = TableDef(
+    "ops.monitor_results",
+    Schema(
+        NestedField(1, "run_at", DateType(), required=True),
+        NestedField(2, "monitor", StringType(), required=True),
+        NestedField(3, "table_name", StringType(), required=True),
+        NestedField(4, "column_name", StringType(), required=False),
+        NestedField(5, "kind", StringType(), required=False),
+        NestedField(6, "metric", DoubleType(), required=False),
+        NestedField(7, "baseline_median", DoubleType(), required=False),
+        NestedField(8, "status", StringType(), required=True),
+        NestedField(9, "detail", StringType(), required=False),
+    ),
+    PartitionSpec(PartitionField(1, 1000, MonthTransform(), "run_at_month")),
+)
+
 ALL_TABLES: tuple[TableDef, ...] = (
     BRONZE_TRANSACTIONS, BRONZE_ACCOUNTS, BRONZE_PRICES,
     SILVER_TRANSACTIONS, SILVER_QUARANTINE, SILVER_ACCOUNTS,
     SILVER_MERCHANT_MAP, SILVER_PRICES,
     GOLD_SPEND, GOLD_STOCK_FEATURES, GOLD_TRAINING, GOLD_PREDICTIONS,
+    OPS_MONITOR_RESULTS,
 )
 
 

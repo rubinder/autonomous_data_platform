@@ -8,7 +8,7 @@ from pyiceberg.exceptions import NamespaceAlreadyExistsError
 
 from src import config
 
-NAMESPACES: tuple[str, ...] = ("bronze", "silver", "gold")
+NAMESPACES: tuple[str, ...] = ("bronze", "silver", "gold", "ops")
 
 
 def get_catalog(warehouse: Path | None = None) -> SqlCatalog:

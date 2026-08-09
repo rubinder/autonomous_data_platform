@@ -1,0 +1,21 @@
+# Bronze row counts are read as `count(*)` over the live table, not as
+# per-snapshot added-records: Bronze is append-only, so the two agree here.
+# (Silver/Gold are full rebuilds every run -- see monitors/silver.yaml and
+# monitors/gold.yaml for why those tables use the same full-scan approach
+# rather than snapshot deltas, which would misread every rebuild as a spike.)
+- name: bronze_txn_row_count
+  table: bronze.yodlee_transactions_raw
+  kind: row_count
+  severity: breaking
+  params: {breach_ratio: 0.5, warn_ratio: 0.8}
+  query: SELECT count(*) AS metric FROM t
+
+- name: bronze_txn_null_id_rate
+  table: bronze.yodlee_transactions_raw
+  kind: null_rate
+  column: id
+  severity: breaking
+  params: {max_absolute: 0}
+  query: >
+    SELECT sum(CASE WHEN id IS NULL THEN 1 ELSE 0 END)
+           * 1.0 / nullif(count(*), 0) AS metric FROM t
