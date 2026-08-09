@@ -1,9 +1,21 @@
 """Read Iceberg metadata and diff it against declared contracts.
 
-Row counts and schemas come from table metadata rather than full scans where
-the engine allows it: the agent is meant to run cheaply and often, and a
-sensor that scans the whole lake on every run is one that gets switched off.
-`snapshot_row_counts` / `snapshot_details` read manifest summaries only.
+Row counts, snapshot counts, and column types all come from table metadata,
+not a data scan: `snapshot_row_counts` / `snapshot_details` read manifest
+summaries, and `schema_history` reads the table's schema definitions --
+already in Iceberg-native vocabulary (`long`, `string`, `struct<...>`, ...),
+the same vocabulary contracts are written in, so no data read and no Arrow
+bridging is needed for schema drift. The agent is meant to run cheaply and
+often, and a sensor that scans the whole lake on every run is one that gets
+switched off.
+
+The one thing Iceberg metadata doesn't carry is the freshness column's
+newest *value* -- that requires reading data. `observe()` pushes that read
+through `engine.sql` as a `MAX(...)` aggregate (the same pattern
+`bronze.max_txn_date` uses), so only the aggregate result crosses back into
+Python rather than every value in the column. The engine protocol has no
+column-projected scan, so this still reads the underlying table once; the
+narrowing is in what gets materialised in Python, not in bytes read off disk.
 
 Volume is compared per snapshot, not on the table's cumulative row count.
 Bronze is append-only, so its total row count only ever grows -- comparing
@@ -38,31 +50,35 @@ class Finding:
     evidence: dict = field(default_factory=dict)
 
 
-def observe(engine, table_def, contract) -> ObservedState:
-    """Build an `ObservedState` for `table_def`, checked against `contract`.
+def observe(engine, table_def, date_column: str | None = None) -> ObservedState:
+    """Build an `ObservedState` for `table_def`.
 
-    Row count and snapshot count come entirely from manifest metadata
-    (`snapshot_details`, `snapshot_row_counts`) -- no data scan. Column types
-    and the freshness column's newest value are read from `scan_arrow`
-    because the engine exposes no metadata-only accessor for either; that
-    scan also means observed types are Arrow's names (`large_string`,
-    `int64`, ...), not Iceberg's (`string`, `long`, ...), which is why
-    `_types_compatible` below has to bridge the two vocabularies.
+    Columns, row count, and snapshot count are metadata-only: `columns`
+    comes from `schema_history` (the table's schema definitions), and the
+    counts come from `snapshot_details` / `snapshot_row_counts` (manifest
+    summaries). `date_column`, if given, names the column to check for
+    freshness; the caller (which already has the contract) is responsible
+    for supplying it, keeping this function decoupled from contract parsing.
+    Its newest value is fetched with a `MAX(...)` pushed through `engine.sql`
+    rather than pulled into a Python list -- see the module docstring for why
+    that still isn't free, and what it does save.
     """
     ident = table_def.name
-    arrow = engine.scan_arrow(ident)
-    columns = {f.name: str(f.type) for f in arrow.schema}
+
+    schema_versions = engine.schema_history(ident)
+    columns = schema_versions[-1]["columns"] if schema_versions else {}
 
     details = engine.snapshot_details(ident)
     per_snapshot = engine.snapshot_row_counts(ident)
-    row_count = details[-1]["total_records"] if details else arrow.num_rows
+    row_count = details[-1]["total_records"] if details else 0
 
     newest = None
-    date_column = _freshness_column(contract)
-    if date_column and date_column in arrow.column_names:
-        values = [v for v in arrow.column(date_column).to_pylist() if v is not None]
-        if values:
-            newest = _to_date(max(values))
+    if date_column and date_column in columns:
+        # date_column is supplied by trusted caller code (a contract's
+        # freshness expectation), never external input.
+        result = engine.sql(f"SELECT max({date_column}) AS d FROM t", tables={"t": ident})
+        if result.num_rows and result.column("d")[0].as_py() is not None:
+            newest = _to_date(result.column("d")[0].as_py())
 
     return ObservedState(
         table=ident,
@@ -72,11 +88,6 @@ def observe(engine, table_def, contract) -> ObservedState:
         snapshot_count=len(per_snapshot),
         newest_date=newest,
     )
-
-
-def _freshness_column(contract) -> str | None:
-    exp = next((e for e in contract.expectations if e.get("type") == "freshness"), None)
-    return exp.get("column") if exp else None
 
 
 def _to_date(value) -> date:
@@ -139,10 +150,15 @@ def detect(state: ObservedState, contract, as_of: date,
     return findings
 
 
-# Declared-contract vocabulary (Iceberg: "string", "long", ...) paired with
-# what an Arrow scan actually reports for it. PyIceberg's `StringType()`
+# `observe()` reads columns from `schema_history`, so in the normal path
+# `declared == observed` already covers scalar types -- both sides use
+# Iceberg vocabulary. This set is a defensive bridge for `ObservedState`
+# built some other way (an Arrow schema, a hand-built test state) where
+# `observed` might be in Arrow's vocabulary instead. Kept because that gap
+# is exactly how bugs like this one hide: PyIceberg's `StringType()`
 # round-trips through Arrow as `large_string`, not `string` -- omitting that
-# pair would make every string column read as a breaking type change.
+# pair would make every Arrow-sourced string column read as a breaking
+# type change.
 _COMPATIBLE = {("long", "int64"), ("string", "string"), ("string", "large_string"),
                ("struct", "struct"), ("double", "double"), ("date", "date32[day]"),
                ("timestamptz", "timestamp[us, tz=UTC]"), ("boolean", "bool")}

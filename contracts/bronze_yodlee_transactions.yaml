@@ -13,3 +13,4 @@ expectations:
   - {type: not_null, column: _ingested_at}
   - {type: accepted_values, column: baseType, values: [CREDIT, DEBIT]}
   - {type: row_count, min: 1000}
+  - {type: freshness, column: transactionDate, max_lag_days: 3}

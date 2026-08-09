@@ -1,6 +1,12 @@
 from datetime import date
 
+import pytest
+
 from src.agent import classifier, sensors
+from src.contracts import validator
+from src.lakehouse import bronze, schemas
+from src.lakehouse import catalog as catalog_mod
+from src.lakehouse.engines.pyiceberg_engine import PyIcebergEngine
 
 
 def _state(**kw):
@@ -10,12 +16,6 @@ def _state(**kw):
             "snapshot_count": 3, "newest_date": date(2026, 6, 30)}
     base.update(kw)
     return sensors.ObservedState(**base)
-
-
-class _Contract:
-    table = "bronze.yodlee_transactions_raw"
-    schema_fields = ()
-    expectations = ()
 
 
 def _contract(fields):
@@ -92,6 +92,43 @@ def test_staleness_measured_against_as_of_not_wall_clock():
     stale = sensors.detect(_state(columns={"id": "long"}), contract,
                            as_of=date(2026, 8, 9), history=[250_000] * 3)
     assert [f for f in stale if f.kind == "staleness"]
+
+
+@pytest.fixture
+def engine(tmp_path):
+    return PyIcebergEngine(catalog_mod.get_catalog(tmp_path / "wh"))
+
+
+def test_observe_reads_real_bronze_table_from_metadata(engine):
+    bronze.ingest_all(engine, n_transactions=1000)
+    ident = schemas.BRONZE_TRANSACTIONS.name
+    expected_last_batch = engine.snapshot_row_counts(ident)[-1]
+    expected_columns = engine.schema_history(ident)[-1]["columns"]
+
+    state = sensors.observe(engine, schemas.BRONZE_TRANSACTIONS, "transactionDate")
+
+    assert state.columns == expected_columns
+    assert state.rows_in_latest_snapshot == expected_last_batch
+    assert state.snapshot_count == len(engine.snapshot_row_counts(ident))
+    assert isinstance(state.newest_date, date)
+    from src import config
+    assert state.newest_date <= config.END_DATE
+
+
+def test_staleness_fires_end_to_end_against_real_bronze_contract(engine):
+    bronze.ingest_all(engine, n_transactions=1000)
+    contract = validator.load_contract(
+        validator.CONTRACTS_DIR / "bronze_yodlee_transactions.yaml")
+    state = sensors.observe(engine, schemas.BRONZE_TRANSACTIONS, "transactionDate")
+    history = engine.snapshot_row_counts(schemas.BRONZE_TRANSACTIONS.name)
+
+    fresh = sensors.detect(state, contract, as_of=date(2026, 6, 30), history=history)
+    assert not [f for f in fresh if f.kind == "staleness"]
+
+    stale = sensors.detect(state, contract, as_of=date(2026, 8, 9), history=history)
+    stale_findings = [f for f in stale if f.kind == "staleness"]
+    assert len(stale_findings) == 1
+    assert classifier.classify(stale_findings[0])[0] == "breaking"
 
 
 def test_llm_disabled_without_api_key(monkeypatch):
