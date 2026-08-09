@@ -1,0 +1,12 @@
+table: gold.forecast_training_set
+version: 1
+owner: data-platform
+schema:
+  - {name: ticker, type: string, nullable: false}
+  - {name: trade_date, type: date, nullable: false}
+  - {name: fwd_ret_5d, type: double, nullable: true}
+expectations:
+  - {type: not_null, column: ticker}
+  - {type: not_null, column: trade_date}
+  - {type: range, column: fwd_ret_5d, min: -0.9, max: 2.0}
+  - {type: row_count, min: 1000}
