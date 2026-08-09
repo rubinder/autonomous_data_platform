@@ -1313,8 +1313,17 @@ class LakehouseEngine(Protocol):
     def overwrite(self, ident: str, data: pa.Table) -> None: ...
     def scan_arrow(self, ident: str, snapshot_id: int | None = None) -> pa.Table: ...
     def snapshots(self, ident: str) -> list[int]: ...
+    def snapshot_row_counts(self, ident: str) -> list[int]: ...
+    def schema_history(self, ident: str) -> list[dict]: ...
     def sql(self, query: str, tables: dict[str, str]) -> pa.Table: ...
 ```
+
+`snapshot_row_counts` returns rows *added per snapshot*, read from each
+snapshot's `added-records` summary — metadata only, no scan. Volume-anomaly
+detection needs per-batch counts: on an append-only table the cumulative row
+count only ever grows, so comparing totals against a trailing median can never
+fire. `schema_history` returns one entry per schema version the table has had,
+which is what makes cross-version querying inspectable.
 
 - [ ] **Step 6: Write `src/lakehouse/engines/pyiceberg_engine.py`**
 
@@ -1364,6 +1373,26 @@ class PyIcebergEngine:
     def snapshots(self, ident: str) -> list[int]:
         table = self.catalog.load_table(ident)
         return [s.snapshot_id for s in table.metadata.snapshots]
+
+    def snapshot_row_counts(self, ident: str) -> list[int]:
+        """Rows added per snapshot, from metadata summaries. No data scan."""
+        table = self.catalog.load_table(ident)
+        counts = []
+        for snapshot in table.metadata.snapshots:
+            summary = getattr(snapshot, "summary", None) or {}
+            added = summary.get("added-records") or summary.get("added_records") or 0
+            counts.append(int(added))
+        return counts
+
+    def schema_history(self, ident: str) -> list[dict]:
+        """One entry per schema version this table has had."""
+        table = self.catalog.load_table(ident)
+        return [
+            {"schema_id": s.schema_id,
+             "columns": {f.name: str(f.field_type) for f in s.fields},
+             "field_ids": {f.name: f.field_id for f in s.fields}}
+            for s in table.metadata.schemas
+        ]
 
     def sql(self, query: str, tables: dict[str, str]) -> pa.Table:
         con = duckdb.connect()
@@ -1699,6 +1728,13 @@ def test_freshness_uses_as_of_not_wall_clock(contract):
     assert any(f.kind == "freshness" for f in stale.failures)
 
 
+def test_sign_inversion_is_caught(contract):
+    """The exact bug Task 8 injects: DEBIT rows must be negative."""
+    unsigned = _table(amounts=(5.0, 10.0, 2.5))  # all positive, DEBIT included
+    report = validator.validate(unsigned, contract, as_of=date(2026, 6, 30))
+    assert any(f.kind == "conditional_sign" for f in report.failures)
+
+
 def test_assert_valid_raises_on_violation(contract):
     with pytest.raises(validator.ContractViolation) as exc:
         validator.assert_valid(_table(ids=(1, 1, 2)), contract, as_of=date(2026, 6, 30))
@@ -1733,9 +1769,17 @@ expectations:
   - {type: unique, column: id}
   - {type: accepted_values, column: base_type, values: [CREDIT, DEBIT]}
   - {type: range, column: signed_amount, min: -100000, max: 100000}
+  - {type: conditional_sign, column: signed_amount, when_column: base_type,
+     when_value: DEBIT, sign: negative}
   - {type: freshness, column: txn_date, max_lag_days: 3}
   - {type: row_count, min: 1}
 ```
+
+`conditional_sign` exists because no combination of `range`, `unique`, and
+`accepted_values` can express "DEBIT rows must be negative". Sign inversion is
+the specific bug Task 8 injects to prove the build fails closed, and without
+this expectation that injection passes validation silently — the test would
+assert a guarantee the contract does not provide.
 
 - [ ] **Step 4: Write `contracts/bronze_yodlee_transactions.yaml`**
 
@@ -1909,6 +1953,20 @@ def _evaluate(table: pa.Table, exp: dict, as_of: date) -> ExpectationResult:
         lo, hi = min(values), max(values)
         ok = lo >= exp.get("min", float("-inf")) and hi <= exp.get("max", float("inf"))
         return ExpectationResult(kind, column, ok, (lo, hi))
+
+    if kind == "conditional_sign":
+        when = table.column(exp["when_column"]).to_pylist()
+        values = col.to_pylist()
+        want_negative = exp["sign"] == "negative"
+        bad = sum(
+            1 for w, v in zip(when, values)
+            if w == exp["when_value"] and v is not None
+            and ((v > 0) if want_negative else (v < 0))
+        )
+        return ExpectationResult(
+            kind, column, bad == 0, bad,
+            f"{bad} row(s) where {exp['when_column']}="
+            f"{exp['when_value']} are not {exp['sign']}")
 
     if kind == "freshness":
         values = [v for v in col.to_pylist() if v is not None]
@@ -3459,7 +3517,8 @@ from src.agent import classifier, sensors
 def _state(**kw):
     base = dict(table="bronze.yodlee_transactions_raw",
                 columns={"id": "long", "baseType": "string", "amount": "struct"},
-                row_count=250_000, snapshot_count=3, newest_date=date(2026, 6, 30))
+                row_count=250_000, rows_in_latest_snapshot=250_000,
+                snapshot_count=3, newest_date=date(2026, 6, 30))
     base.update(kw)
     return sensors.ObservedState(**base)
 
@@ -3518,9 +3577,10 @@ def test_type_narrowing_is_breaking():
 
 def test_volume_collapse_is_detected():
     contract = _contract([("id", "long")])
-    findings = sensors.detect(_state(row_count=1000, columns={"id": "long"}),
-                              contract, as_of=date(2026, 6, 30),
-                              history=[250_000, 249_000, 251_000, 248_000])
+    findings = sensors.detect(
+        _state(rows_in_latest_snapshot=1000, columns={"id": "long"}),
+        contract, as_of=date(2026, 6, 30),
+        history=[250_000, 249_000, 251_000, 248_000])
     vol = [f for f in findings if f.kind == "volume_anomaly"]
     assert len(vol) == 1
     assert classifier.classify(vol[0])[0] == "breaking"
@@ -3528,9 +3588,10 @@ def test_volume_collapse_is_detected():
 
 def test_modest_volume_change_is_not_flagged():
     contract = _contract([("id", "long")])
-    findings = sensors.detect(_state(row_count=230_000, columns={"id": "long"}),
-                              contract, as_of=date(2026, 6, 30),
-                              history=[250_000, 249_000, 251_000])
+    findings = sensors.detect(
+        _state(rows_in_latest_snapshot=230_000, columns={"id": "long"}),
+        contract, as_of=date(2026, 6, 30),
+        history=[250_000, 249_000, 251_000])
     assert not [f for f in findings if f.kind == "volume_anomaly"]
 
 
@@ -3579,6 +3640,7 @@ class ObservedState:
     table: str
     columns: dict[str, str]
     row_count: int
+    rows_in_latest_snapshot: int
     snapshot_count: int
     newest_date: date | None
 
@@ -3601,11 +3663,13 @@ def observe(engine, table_def, date_column: str | None = None) -> ObservedState:
             newest = max(values)
             newest = date.fromisoformat(newest) if isinstance(newest, str) else newest
             newest = newest.date() if hasattr(newest, "date") else newest
+    per_snapshot = engine.snapshot_row_counts(table_def.name)
     return ObservedState(
         table=table_def.name,
         columns=columns,
         row_count=arrow.num_rows,
-        snapshot_count=len(engine.snapshots(table_def.name)),
+        rows_in_latest_snapshot=per_snapshot[-1] if per_snapshot else 0,
+        snapshot_count=len(per_snapshot),
         newest_date=newest,
     )
 
@@ -3638,14 +3702,17 @@ def detect(state: ObservedState, contract, as_of: date,
                 {"change": "added", "column": name,
                  "observed_type": observed[name]}))
 
+    # Per-batch, not cumulative: an append-only table's total row count only
+    # ever grows, so a total-vs-median check can never fire.
     if history:
         median = statistics.median(history)
-        if median > 0 and state.row_count < median * VOLUME_COLLAPSE_RATIO:
+        observed = state.rows_in_latest_snapshot
+        if median > 0 and observed < median * VOLUME_COLLAPSE_RATIO:
             findings.append(Finding(
                 "volume_anomaly", state.table,
-                f"row count {state.row_count:,} is below "
+                f"latest snapshot added {observed:,} rows, below "
                 f"{VOLUME_COLLAPSE_RATIO:.0%} of trailing median {median:,.0f}",
-                {"row_count": state.row_count, "median": median}))
+                {"rows_in_latest_snapshot": observed, "median": median}))
 
     freshness = next((e for e in contract.expectations
                       if e.get("type") == "freshness"), None)
@@ -3697,9 +3764,9 @@ _WIDENING = {("int", "long"), ("int32", "int64"), ("float", "double")}
 def classify(finding: Finding) -> tuple[str, str]:
     if finding.kind == "volume_anomaly":
         return "breaking", (
-            f"Row count {finding.evidence.get('row_count'):,} collapsed against a "
-            f"trailing median of {finding.evidence.get('median'):,.0f}. Downstream "
-            "aggregates will be silently wrong rather than obviously missing.")
+            f"Latest batch added {finding.evidence.get('rows_in_latest_snapshot'):,} "
+            f"rows against a trailing median of {finding.evidence.get('median'):,.0f}. "
+            "Downstream aggregates will be silently wrong rather than obviously missing.")
 
     if finding.kind == "staleness":
         return "breaking", (
@@ -3890,6 +3957,12 @@ class _FakeEngine:
     def snapshots(self, ident):
         return [1, 2, 3]
 
+    def snapshot_row_counts(self, ident):
+        return [2, 2, 2]
+
+    def schema_history(self, ident):
+        return [{"schema_id": 0, "columns": {}, "field_ids": {}}]
+
     def table_exists(self, ident):
         return True
 ```
@@ -3997,7 +4070,10 @@ def sense_and_detect(state: AgentState) -> AgentState:
     for table_def, contract_file, date_column in WATCHED:
         contract = validator.load_contract(validator.CONTRACTS_DIR / contract_file)
         observed = sensors.observe(engine, table_def, date_column=date_column)
-        history = [observed.row_count] * max(observed.snapshot_count - 1, 1)
+        # Trailing history excludes the latest snapshot -- comparing a batch
+        # against a median that includes itself blunts the signal.
+        per_snapshot = engine.snapshot_row_counts(table_def.name)
+        history = per_snapshot[:-1] or per_snapshot
         findings += sensors.detect(observed, contract, state["as_of"], history)
     return {**state, "findings": findings}
 
@@ -4102,20 +4178,148 @@ The graph test uses a stub engine so it needs no warehouse and no network."
 
 ---
 
-## Task 16: Iceberg maintenance, time travel, and reproducible drift scenarios
+## Task 16: Schema evolution, cross-version queries, and Iceberg maintenance
+
+Iceberg resolves columns by **field ID**, not by name or position. That is what
+lets a file written under schema v1 be read correctly under schema v5 after a
+column has been added, widened, and renamed. This task proves that property
+rather than asserting it, and gives the ops agent real drift to find.
 
 **Files:**
 - Create: `src/lakehouse/maintenance.py`
-- Test: `tests/test_maintenance.py`
+- Modify: `Makefile` (add `schema-history`, `cross-version` targets)
+- Test: `tests/test_maintenance.py`, `tests/test_schema_evolution.py`
 
 **Interfaces:**
-- Consumes: `get_engine`, `schemas.BRONZE_TRANSACTIONS`, `bronze.ingest_all`
-- Produces: `maintenance.time_travel_demo(engine) -> dict[str, int]`; `maintenance.evolve_schema(engine, column: str = "merchantCategoryCode") -> None`; `maintenance.inject_volume_collapse(engine) -> int`; `maintenance.expire(engine, retain_last: int = 5) -> int`; `python -m src.lakehouse.maintenance {timetravel|drift-demo|expire}` CLI
+- Consumes: `get_engine`, `schemas.BRONZE_TRANSACTIONS`, `bronze.ingest_all`, `engine.schema_history`, `engine.snapshot_row_counts`
+- Produces:
+  - `maintenance.evolve_add_column(engine, name, iceberg_type) -> bool`
+  - `maintenance.evolve_widen_column(engine, name, iceberg_type) -> bool`
+  - `maintenance.evolve_rename_column(engine, old, new) -> bool`
+  - `maintenance.evolve_all(engine) -> list[str]` — applies the v2→v5 sequence, returns applied step names
+  - `maintenance.schema_versions(engine, ident) -> list[dict]`
+  - `maintenance.query_across_versions(engine, ident) -> pa.Table` — every snapshot's rows, reconciled to the current schema, tagged `_snapshot_id` / `_schema_id`
+  - `maintenance.incremental_rows(engine, ident, from_snapshot, to_snapshot) -> int`
+  - `maintenance.time_travel_demo(engine) -> dict[str, int]`
+  - `maintenance.inject_volume_collapse(engine) -> int`
+  - `maintenance.expire(engine, retain_last: int = 5) -> int`
+  - CLI: `python -m src.lakehouse.maintenance {timetravel|drift-demo|schema-history|cross-version|expire}`
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the schema-evolution test**
+
+```python
+# tests/test_schema_evolution.py
+import pytest
+from pyiceberg.types import IntegerType, LongType, StringType
+
+from src.lakehouse import bronze, catalog as catalog_mod, maintenance, schemas
+from src.lakehouse.engines.pyiceberg_engine import PyIcebergEngine
+
+IDENT = schemas.BRONZE_TRANSACTIONS.name
+
+
+@pytest.fixture
+def engine(tmp_path):
+    eng = PyIcebergEngine(catalog_mod.get_catalog(tmp_path / "wh"))
+    bronze.ingest_all(eng, n_transactions=1000)   # written under schema v1
+    return eng
+
+
+def test_added_column_is_null_for_rows_written_before_it(engine):
+    rows_before = engine.scan_arrow(IDENT).num_rows
+    maintenance.evolve_add_column(engine, "merchantCategoryCode", StringType())
+    current = engine.scan_arrow(IDENT)
+    assert "merchantCategoryCode" in current.column_names
+    assert current.num_rows == rows_before
+    # Old files carry no such column; Iceberg fills it rather than failing.
+    assert current.column("merchantCategoryCode").null_count == rows_before
+
+
+def test_old_snapshot_still_readable_after_evolution(engine):
+    before = engine.snapshots(IDENT)[-1]
+    maintenance.evolve_all(engine)
+    historical = engine.scan_arrow(IDENT, snapshot_id=before)
+    assert historical.num_rows > 0
+
+
+def test_widening_int_to_long_preserves_existing_values(engine):
+    maintenance.evolve_add_column(engine, "settlementDays", IntegerType())
+    bronze.ingest_all(engine, n_transactions=200)
+    widened = maintenance.evolve_widen_column(engine, "settlementDays", LongType())
+    assert widened
+    out = engine.scan_arrow(IDENT)
+    assert "settlementDays" in out.column_names
+    assert out.num_rows == 1200
+
+
+def test_rename_resolves_by_field_id_not_name(engine):
+    """The crux: rows written before the rename read back under the NEW name."""
+    rows_before = engine.scan_arrow(IDENT).num_rows
+    field_id_before = engine.schema_history(IDENT)[-1]["field_ids"]["checkNumber"]
+
+    maintenance.evolve_rename_column(engine, "checkNumber", "check_reference")
+
+    out = engine.scan_arrow(IDENT)
+    assert "check_reference" in out.column_names
+    assert "checkNumber" not in out.column_names
+    assert out.num_rows == rows_before          # no rewrite, no data loss
+    field_id_after = engine.schema_history(IDENT)[-1]["field_ids"]["check_reference"]
+    assert field_id_after == field_id_before    # same field, new name
+
+
+def test_schema_history_records_every_version(engine):
+    maintenance.evolve_all(engine)
+    history = maintenance.schema_versions(engine, IDENT)
+    assert len(history) >= 4
+    assert len({h["schema_id"] for h in history}) == len(history)
+    assert "merchantCategoryCode" in history[-1]["columns"]
+
+
+def test_cross_version_query_spans_every_snapshot(engine):
+    """Ingest under v1, evolve, ingest under v5, query the whole history."""
+    maintenance.evolve_add_column(engine, "merchantCategoryCode", StringType())
+    bronze.ingest_all(engine, n_transactions=500)
+    maintenance.evolve_rename_column(engine, "checkNumber", "check_reference")
+    bronze.ingest_all(engine, n_transactions=300)
+
+    combined = maintenance.query_across_versions(engine, IDENT)
+    assert "_snapshot_id" in combined.column_names
+    assert "_schema_id" in combined.column_names
+    assert "check_reference" in combined.column_names
+    # Rows appear once per snapshot in which the table contained them.
+    assert combined.num_rows > 1800
+    assert len(set(combined.column("_snapshot_id").to_pylist())) == 3
+
+
+def test_cross_version_query_reconciles_missing_columns_to_null(engine):
+    maintenance.evolve_add_column(engine, "merchantCategoryCode", StringType())
+    bronze.ingest_all(engine, n_transactions=200)
+    combined = maintenance.query_across_versions(engine, IDENT)
+    assert "merchantCategoryCode" in combined.column_names
+    # The first snapshot predates the column entirely.
+    assert combined.column("merchantCategoryCode").null_count > 0
+
+
+def test_incremental_read_returns_only_the_delta(engine):
+    first = engine.snapshots(IDENT)[-1]
+    bronze.ingest_all(engine, n_transactions=400)
+    second = engine.snapshots(IDENT)[-1]
+    assert maintenance.incremental_rows(engine, IDENT, first, second) == 400
+
+
+def test_evolution_is_idempotent(engine):
+    maintenance.evolve_all(engine)
+    schema_count = len(maintenance.schema_versions(engine, IDENT))
+    maintenance.evolve_all(engine)      # re-running must be a no-op
+    assert len(maintenance.schema_versions(engine, IDENT)) == schema_count
+```
+
+- [ ] **Step 2: Write the maintenance test**
 
 ```python
 # tests/test_maintenance.py
+from datetime import date
+
 import pytest
 
 from src.lakehouse import bronze, catalog as catalog_mod, maintenance, schemas
@@ -4130,109 +4334,219 @@ def engine(tmp_path):
 
 
 def test_time_travel_shows_history_growing(engine):
+    bronze.ingest_all(engine, n_transactions=500)
     result = maintenance.time_travel_demo(engine)
     assert result["rows_at_first_snapshot"] < result["rows_at_latest_snapshot"]
 
 
-def test_schema_evolution_adds_column_and_old_snapshots_still_readable(engine):
-    before = engine.snapshots(schemas.BRONZE_TRANSACTIONS.name)[-1]
-    maintenance.evolve_schema(engine)
-    current = engine.scan_arrow(schemas.BRONZE_TRANSACTIONS.name)
-    assert "merchantCategoryCode" in current.column_names
-    historical = engine.scan_arrow(schemas.BRONZE_TRANSACTIONS.name, snapshot_id=before)
-    assert historical.num_rows > 0
-
-
-def test_evolved_column_is_detected_as_drift_by_the_agent(engine):
-    from datetime import date
+def test_evolved_column_detected_as_additive_drift_by_the_agent(engine):
+    from pyiceberg.types import StringType
     from src.agent import classifier, sensors
     from src.contracts import validator
-    maintenance.evolve_schema(engine)
+
+    maintenance.evolve_add_column(engine, "merchantCategoryCode", StringType())
     contract = validator.load_contract(
         validator.CONTRACTS_DIR / "bronze_yodlee_transactions.yaml")
     state = sensors.observe(engine, schemas.BRONZE_TRANSACTIONS, "transactionDate")
     findings = sensors.detect(state, contract, date(2026, 6, 30),
-                              history=[state.row_count])
+                              history=[state.rows_in_latest_snapshot])
     added = [f for f in findings
              if f.evidence.get("column") == "merchantCategoryCode"]
     assert added
     assert classifier.classify(added[0])[0] == "additive"
 
 
-def test_volume_collapse_scenario_is_detectable(engine):
-    from datetime import date
+def test_volume_collapse_is_detected_without_violating_append_only(engine):
     from src.agent import sensors
     from src.contracts import validator
-    before = engine.scan_arrow(schemas.BRONZE_TRANSACTIONS.name).num_rows
-    maintenance.inject_volume_collapse(engine)
+
+    rows_before = engine.scan_arrow(schemas.BRONZE_TRANSACTIONS.name).num_rows
+    history = engine.snapshot_row_counts(schemas.BRONZE_TRANSACTIONS.name)
+    added = maintenance.inject_volume_collapse(engine)
+
+    # Bronze stays append-only: the collapse is a tiny APPEND, not a rewrite.
+    assert engine.scan_arrow(
+        schemas.BRONZE_TRANSACTIONS.name).num_rows == rows_before + added
+
     contract = validator.load_contract(
         validator.CONTRACTS_DIR / "bronze_yodlee_transactions.yaml")
     state = sensors.observe(engine, schemas.BRONZE_TRANSACTIONS, "transactionDate")
-    findings = sensors.detect(state, contract, date(2026, 6, 30), history=[before])
+    findings = sensors.detect(state, contract, date(2026, 6, 30), history=history)
     assert any(f.kind == "volume_anomaly" for f in findings)
 
 
 def test_expire_snapshots_retains_requested_count(engine):
     for _ in range(4):
-        bronze.ingest_all(engine, n_transactions=500)
+        bronze.ingest_all(engine, n_transactions=300)
     assert len(engine.snapshots(schemas.BRONZE_TRANSACTIONS.name)) > 3
     maintenance.expire(engine, retain_last=2)
     assert len(engine.snapshots(schemas.BRONZE_TRANSACTIONS.name)) <= 3
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 3: Run both test files to verify they fail**
 
-Run: `uv run pytest tests/test_maintenance.py -v`
+Run: `uv run pytest tests/test_schema_evolution.py tests/test_maintenance.py -v`
 Expected: FAIL — `src.lakehouse.maintenance` not found.
 
-- [ ] **Step 3: Write `src/lakehouse/maintenance.py`**
+- [ ] **Step 4: Write `src/lakehouse/maintenance.py`**
 
 ```python
-"""Iceberg operations that justify choosing Iceberg, plus reproducible drift.
+"""Schema evolution, cross-version queries, and Iceberg table maintenance.
 
-The drift scenarios exist so the ops agent has something real to find. An
-agent demonstrated only against hand-written fixtures proves nothing about
-whether it works against actual table metadata.
+Iceberg resolves columns by field ID, not by name or position. A file written
+under schema v1 still reads correctly under v5 after columns have been added,
+widened, and renamed -- no rewrite, no backfill. The functions here exercise
+that property, and the tests check it rather than trusting it.
+
+The drift injectors exist so the ops agent has real table mutations to find.
+An agent proven only against hand-written fixtures proves nothing about
+whether it reads actual metadata correctly.
 """
 from __future__ import annotations
 
 import sys
 
-from pyiceberg.types import StringType
+import pyarrow as pa
+from pyiceberg.types import IntegerType, LongType, StringType
 
 from src.lakehouse import bronze, schemas
 from src.lakehouse.engines import get_engine
 
+IDENT = schemas.BRONZE_TRANSACTIONS.name
 
-def time_travel_demo(engine) -> dict[str, int]:
-    ident = schemas.BRONZE_TRANSACTIONS.name
+
+def _columns(engine, ident: str) -> set[str]:
+    table = engine.catalog.load_table(ident)
+    return {f.name for f in table.schema().fields}
+
+
+def evolve_add_column(engine, name: str, iceberg_type, ident: str = IDENT) -> bool:
+    """Additive evolution. Existing files gain the column as NULL, unrewritten."""
+    if name in _columns(engine, ident):
+        return False
+    table = engine.catalog.load_table(ident)
+    with table.update_schema() as update:
+        update.add_column(name, iceberg_type)
+    return True
+
+
+def evolve_widen_column(engine, name: str, iceberg_type, ident: str = IDENT) -> bool:
+    """Type promotion (int -> long). Allowed because every existing value fits."""
+    if name not in _columns(engine, ident):
+        return False
+    table = engine.catalog.load_table(ident)
+    with table.update_schema() as update:
+        update.update_column(name, field_type=iceberg_type)
+    return True
+
+
+def evolve_rename_column(engine, old: str, new: str, ident: str = IDENT) -> bool:
+    """Rename. The field ID is unchanged, so old files need no rewrite."""
+    columns = _columns(engine, ident)
+    if old not in columns or new in columns:
+        return False
+    table = engine.catalog.load_table(ident)
+    with table.update_schema() as update:
+        update.rename_column(old, new)
+    return True
+
+
+def evolve_all(engine, ident: str = IDENT) -> list[str]:
+    """The v2 -> v5 sequence. Idempotent: re-running applies nothing."""
+    applied = []
+    if evolve_add_column(engine, "merchantCategoryCode", StringType(), ident):
+        applied.append("v2: +merchantCategoryCode (string)")
+    if evolve_add_column(engine, "settlementDays", IntegerType(), ident):
+        applied.append("v3: +settlementDays (int)")
+    if evolve_widen_column(engine, "settlementDays", LongType(), ident):
+        applied.append("v4: settlementDays int -> long")
+    if evolve_rename_column(engine, "checkNumber", "check_reference", ident):
+        applied.append("v5: checkNumber -> check_reference")
+    return applied
+
+
+def schema_versions(engine, ident: str = IDENT) -> list[dict]:
+    return engine.schema_history(ident)
+
+
+def query_across_versions(engine, ident: str = IDENT) -> pa.Table:
+    """Union every snapshot's contents, reconciled to the current schema.
+
+    Columns absent from an older snapshot are filled with NULL rather than
+    dropped, so a query can span a schema change without the caller knowing
+    one happened. Each row is tagged with the snapshot it came from.
+    """
+    table = engine.catalog.load_table(ident)
+    current = table.schema().as_arrow()
+    frames: list[pa.Table] = []
+
+    for snapshot in table.metadata.snapshots:
+        rows = engine.scan_arrow(ident, snapshot_id=snapshot.snapshot_id)
+        aligned = _align_to(rows, current)
+        n = aligned.num_rows
+        aligned = aligned.append_column(
+            "_snapshot_id", pa.array([snapshot.snapshot_id] * n, pa.int64()))
+        aligned = aligned.append_column(
+            "_schema_id", pa.array([snapshot.schema_id] * n, pa.int32()))
+        frames.append(aligned)
+
+    return pa.concat_tables(frames) if frames else current.empty_table()
+
+
+def _align_to(rows: pa.Table, target: pa.Schema) -> pa.Table:
+    """Project rows onto target, filling absent columns with typed nulls."""
+    arrays, names = [], []
+    for field in target:
+        if field.name in rows.column_names:
+            arrays.append(rows.column(field.name).cast(field.type))
+        else:
+            arrays.append(pa.nulls(rows.num_rows, field.type))
+        names.append(field.name)
+    return pa.Table.from_arrays(arrays, names=names)
+
+
+def incremental_rows(engine, ident: str, from_snapshot: int,
+                     to_snapshot: int) -> int:
+    """Rows added between two snapshots, from metadata summaries only."""
+    table = engine.catalog.load_table(ident)
+    seen, total = False, 0
+    for snapshot in table.metadata.snapshots:
+        if snapshot.snapshot_id == from_snapshot:
+            seen = True
+            continue
+        if seen:
+            summary = getattr(snapshot, "summary", None) or {}
+            total += int(summary.get("added-records")
+                         or summary.get("added_records") or 0)
+        if snapshot.snapshot_id == to_snapshot:
+            break
+    return total
+
+
+def time_travel_demo(engine, ident: str = IDENT) -> dict[str, int]:
     snaps = engine.snapshots(ident)
     if len(snaps) < 2:
         bronze.ingest_all(engine, n_transactions=500)
         snaps = engine.snapshots(ident)
     return {
         "snapshot_count": len(snaps),
-        "rows_at_first_snapshot": engine.scan_arrow(ident, snapshot_id=snaps[0]).num_rows,
+        "rows_at_first_snapshot": engine.scan_arrow(
+            ident, snapshot_id=snaps[0]).num_rows,
         "rows_at_latest_snapshot": engine.scan_arrow(ident).num_rows,
     }
 
 
-def evolve_schema(engine, column: str = "merchantCategoryCode") -> None:
-    """Additive schema evolution: old snapshots stay readable."""
-    table = engine.catalog.load_table(schemas.BRONZE_TRANSACTIONS.name)
-    if column in {f.name for f in table.schema().fields}:
-        return
-    with table.update_schema() as update:
-        update.add_column(column, StringType())
+def inject_volume_collapse(engine, ident: str = IDENT, rows: int = 5) -> int:
+    """Append a near-empty batch so the per-snapshot volume check fires.
 
-
-def inject_volume_collapse(engine) -> int:
-    """Append a near-empty batch so the trailing-median check fires."""
+    An APPEND, not an overwrite: Bronze stays append-only (Global Constraints),
+    and a collapsed batch is what a real upstream outage actually looks like.
+    """
     table_def = schemas.BRONZE_TRANSACTIONS
-    engine.overwrite(
-        table_def.name,
-        engine.scan_arrow(table_def.name).slice(0, 5))
-    return 5
+    latest = engine.scan_arrow(ident).slice(0, rows)
+    engine.append(ident, latest.select(
+        [f.name for f in table_def.schema.as_arrow()]))
+    return rows
 
 
 def expire(engine, retain_last: int = 5) -> int:
@@ -4256,12 +4570,34 @@ def main() -> int:
     if command == "timetravel":
         for key, value in time_travel_demo(engine).items():
             print(f"timetravel: {key} = {value:,}")
+
     elif command == "drift-demo":
-        evolve_schema(engine)
-        print("drift-demo: added merchantCategoryCode to Bronze (additive)")
-        print("drift-demo: run `make agent` to see it detected")
+        applied = evolve_all(engine)
+        for step in applied:
+            print(f"drift-demo: applied {step}")
+        added = inject_volume_collapse(engine)
+        print(f"drift-demo: appended a collapsed batch of {added} rows")
+        print("drift-demo: run `make agent` to see these detected")
+
+    elif command == "schema-history":
+        for version in schema_versions(engine):
+            print(f"schema {version['schema_id']}: "
+                  f"{len(version['columns'])} columns")
+            for name, dtype in version["columns"].items():
+                print(f"    [{version['field_ids'][name]:>3}] {name}: {dtype}")
+
+    elif command == "cross-version":
+        combined = query_across_versions(engine)
+        print(f"cross-version: {combined.num_rows:,} rows across "
+              f"{len(set(combined.column('_snapshot_id').to_pylist()))} snapshot(s)")
+        for schema_id in sorted(set(combined.column("_schema_id").to_pylist())):
+            n = sum(1 for v in combined.column("_schema_id").to_pylist()
+                    if v == schema_id)
+            print(f"    schema {schema_id}: {n:,} rows")
+
     elif command == "expire":
         print(f"maintenance: expired {expire(engine)} snapshot(s)")
+
     else:
         print(f"unknown command: {command}", file=sys.stderr)
         return 1
@@ -4272,35 +4608,63 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
-- [ ] **Step 4: Run tests**
+- [ ] **Step 5: Add the new Makefile targets**
 
-Run: `uv run pytest tests/test_maintenance.py -v`
-Expected: 5 passed.
+Add to the `.PHONY` line and the target list in `Makefile`:
 
-If `expire_snapshots()` is not available on your PyIceberg version, check the installed API (`uv run python -c "import pyiceberg; print(pyiceberg.__version__)"`) and use the equivalent maintenance call. Do not delete the test — snapshot expiry is one of the Iceberg features the project claims to demonstrate.
+```makefile
+schema-history: ; $(UV) python -m src.lakehouse.maintenance schema-history
+cross-version:  ; $(UV) python -m src.lakehouse.maintenance cross-version
+```
 
-- [ ] **Step 5: Verify the drift scenario end to end**
+- [ ] **Step 6: Run both test files**
+
+Run: `uv run pytest tests/test_schema_evolution.py tests/test_maintenance.py -v`
+Expected: 13 passed (9 evolution + 4 maintenance).
+
+If `update_column(name, field_type=...)` is not the signature on your PyIceberg version, check `uv run python -c "import pyiceberg; print(pyiceberg.__version__)"` and the `UpdateSchema` API. Do not delete `test_widening_int_to_long_preserves_existing_values` — type promotion is one of the Iceberg properties this task exists to demonstrate.
+
+If `test_rename_resolves_by_field_id_not_name` fails on the field-ID assertion, that is the single most important failure in this file: it means the rename rewrote the field rather than relabelling it, and every claim about cross-version reads is void. Investigate before proceeding.
+
+- [ ] **Step 7: Verify the whole story end to end**
 
 ```bash
 uv run make all
+uv run make schema-history
 uv run make drift-demo
+uv run make cross-version
 uv run make agent
+uv run make timetravel
 ```
-Expected: the agent reports a `schema_drift` finding for `merchantCategoryCode` classified `additive`, and takes no action (only `breaking` is actionable).
 
-- [ ] **Step 6: Commit**
+Expected: `schema-history` prints schema 0 then the evolved versions with stable
+field IDs; `cross-version` prints per-schema row counts spanning every snapshot;
+`agent` reports the added columns as `additive` and the collapsed batch as
+`breaking`, writing an incident for the latter only.
+
+- [ ] **Step 8: Commit**
 
 ```bash
-git add src/lakehouse/maintenance.py tests/test_maintenance.py
-git commit -m "feat: time travel, schema evolution, snapshot expiry, drift scenarios
+git add src/lakehouse/maintenance.py tests/test_schema_evolution.py tests/test_maintenance.py Makefile
+git commit -m "feat: schema evolution, cross-version queries, and maintenance
 
-The drift scenarios mutate real Iceberg tables rather than hand-built
-fixtures. An agent proven only against fixtures proves nothing about
-whether it reads actual table metadata correctly.
+Four evolution steps applied to a live Bronze table -- add column, add
+column, widen int->long, rename -- with no data rewritten. The rename test
+asserts the field ID is unchanged, which is the actual mechanism: Iceberg
+resolves by field ID, so files written under v1 read correctly under v5.
+If that assertion ever fails, every claim about cross-version reads is void.
 
-test_evolved_column_is_detected_as_drift_by_the_agent wires the two halves
-together: evolve the real schema, then assert the sensor sees it and the
-classifier calls it additive."
+query_across_versions unions every snapshot reconciled to the current
+schema, filling absent columns with typed nulls rather than dropping them,
+so a query can span a schema change without the caller knowing one
+happened. Each row is tagged with its snapshot and schema id.
+
+inject_volume_collapse APPENDS a tiny batch rather than overwriting. The
+earlier draft rewrote Bronze, which violated the append-only constraint and
+was also the wrong shape -- a real upstream outage produces a small batch,
+not a truncated table. Volume detection correspondingly moved to
+per-snapshot added-records, since a cumulative count on an append-only
+table can never collapse."
 ```
 
 ---
@@ -4602,6 +4966,12 @@ def test_readme_does_not_overclaim_real_alpha():
     assert "synthetic" in text
 
 
+def test_readme_documents_schema_evolution_and_cross_version_queries():
+    text = (config.REPO_ROOT / "README.md").read_text()
+    assert "## Schema evolution and cross-version queries" in text
+    assert "field ID" in text or "field-ID" in text
+
+
 def test_ai_sdlc_workflow_documented():
     assert (DOCS / "ai-sdlc" / "workflow.md").exists()
     assert (DOCS / "ai-sdlc" / "decisions" / "0001-sklearn-over-lightgbm.md").exists()
@@ -4631,7 +5001,9 @@ Record the documented deviation: the spec named `LGBMRegressor`; implementation 
 
 - [ ] **Step 5: Write `README.md`**
 
-Required sections, matching the test: `## What this is`, `## The problem it solves`, `## Architecture` (with the Mermaid diagram from the spec §3), `## Quickstart`, `## AI-Driven SDLC`, `## The agentic ops layer`, `## GitHub Actions`, `## Results`, `## What I'd do differently at production scale`.
+Required sections, matching the test: `## What this is`, `## The problem it solves`, `## Architecture` (with the Mermaid diagram from the spec §3), `## Quickstart`, `## Schema evolution and cross-version queries`, `## AI-Driven SDLC`, `## The agentic ops layer`, `## GitHub Actions`, `## Results`, `## What I'd do differently at production scale`.
+
+The schema-evolution section must show the actual v1→v5 sequence from Task 16 with real `make schema-history` and `make cross-version` output, and explain the field-ID mechanism: renaming a column changes its name but not its ID, which is why files written under v1 still read correctly under v5 with no rewrite and no backfill.
 
 Two things the README must do:
 - State plainly that prices are synthetic with a planted signal, and that the results measure pipeline fidelity rather than real alpha.
