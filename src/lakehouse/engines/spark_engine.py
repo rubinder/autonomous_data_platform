@@ -17,7 +17,9 @@ Three environment quirks shaped this file, each documented at its use site:
    using the *JVM's default timezone*, not `spark.sql.session.timeZone`
    (that config only affects SQL-level parsing/formatting). The JVM
    timezone is fixed at process start, so `TZ` has to be set before any
-   SparkSession exists -- see the module-level block below.
+   SparkSession exists -- done at the top of `SparkEngine.__init__`, not
+   at module import time, so importing this module has no side effect on
+   a process that never constructs a SparkEngine.
 2. `DataFrame.toPandas()` -- and therefore `pa.Table.from_pandas` -- goes
    through `pyspark.sql.pandas.conversion`, which imports
    `distutils.version.LooseVersion`. `distutils` was removed in Python
@@ -47,26 +49,53 @@ from src.lakehouse.schemas import TableDef
 
 ICEBERG_RUNTIME = "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2"
 
-# See docstring point 1. Must run before any SparkSession (and therefore
-# before the JVM) is created. `setdefault` respects an operator's explicit
-# TZ rather than clobbering it; the default keeps runs reproducible
-# regardless of the host machine's local timezone.
-os.environ.setdefault("TZ", "UTC")
-if hasattr(time, "tzset"):
-    time.tzset()
-
 # DuckDB accepts `TIMESTAMP WITH TIME ZONE` as a CAST target; Spark SQL's
 # parser rejects it outright (`PARSE_SYNTAX_ERROR`). Both engines' TIMESTAMP
 # type is an instant (UTC-based) under the hood, so this is a syntax
 # translation, not a semantic one -- the SQL strings in `silver.py` are
 # authored once and run, unmodified, through whichever engine's `sql()` is
 # called; this is the one spelling Spark cannot parse.
-_TSTZ = re.compile(r"TIMESTAMP\s+WITH\s+TIME\s+ZONE", re.IGNORECASE)
+#
+# Scoped to `AS TIMESTAMP WITH TIME ZONE` (a CAST target) rather than the
+# bare phrase, and applied only outside single-quoted string literals (see
+# `_translate_tstz_cast`) -- a query that legitimately contains this text
+# as *data*, not syntax, must come back unchanged. This is a narrow dialect
+# shim, not a SQL parser: it does not understand double-quoted identifiers,
+# dollar-quoted strings, or comments, none of which appear in this
+# codebase's queries today.
+_TSTZ_CAST = re.compile(r"\bAS\s+TIMESTAMP\s+WITH\s+TIME\s+ZONE\b", re.IGNORECASE)
+_STRING_LITERAL = re.compile(r"'(?:[^']|'')*'")
+
+
+def _translate_tstz_cast(query: str) -> str:
+    """Rewrite `AS TIMESTAMP WITH TIME ZONE` -> `AS TIMESTAMP`, skipping
+    anything inside a single-quoted string literal."""
+    pieces, cursor = [], 0
+    for literal in _STRING_LITERAL.finditer(query):
+        pieces.append(_TSTZ_CAST.sub("AS TIMESTAMP", query[cursor:literal.start()]))
+        pieces.append(literal.group(0))  # untouched: this is data, not syntax
+        cursor = literal.end()
+    pieces.append(_TSTZ_CAST.sub("AS TIMESTAMP", query[cursor:]))
+    return "".join(pieces)
 
 
 class SparkEngine:
     def __init__(self, warehouse: Path | None = None):
         from pyspark.sql import SparkSession
+
+        # Py4J converts Iceberg TIMESTAMP values to Python `datetime.datetime`
+        # using the *JVM's default timezone*, not `spark.sql.session.timeZone`
+        # (that config only affects SQL-level parsing/formatting -- verified
+        # live: with only the config set, a collected TIMESTAMP came back
+        # shifted by the host's local UTC offset). The JVM timezone is fixed
+        # at process start, so this has to run before the JVM exists, which
+        # means before the SparkSession below -- not at module import time,
+        # since importing this module must not reconfigure the host process's
+        # clock for code that never constructs a SparkEngine. `setdefault`
+        # respects an operator's explicit TZ rather than clobbering it.
+        os.environ.setdefault("TZ", "UTC")
+        if hasattr(time, "tzset"):
+            time.tzset()
 
         wh = Path(warehouse or config.WAREHOUSE_PATH / "spark")
         wh.mkdir(parents=True, exist_ok=True)
@@ -228,7 +257,7 @@ class SparkEngine:
     def sql(self, query: str, tables: dict[str, str]) -> pa.Table:
         for alias, ident in tables.items():
             self.spark.sql(f"SELECT * FROM {self._q(ident)}").createOrReplaceTempView(alias)
-        translated = _TSTZ.sub("TIMESTAMP", query)
+        translated = _translate_tstz_cast(query)
         try:
             return _df_to_arrow(self.spark.sql(translated))
         finally:

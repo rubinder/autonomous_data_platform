@@ -141,3 +141,31 @@ def test_spark_engine_schema_history_and_arrow_schema(spark_engine):
     assert len(history) == 1
     assert set(history[0]["columns"]) == set(td.schema.as_arrow().names)
     assert set(spark_engine.arrow_schema(td.name).names) == set(td.schema.as_arrow().names)
+
+
+@pytest.mark.spark
+def test_tstz_cast_translation_leaves_string_literals_alone():
+    """`sql()`'s dialect shim rewrites `AS TIMESTAMP WITH TIME ZONE` (a CAST
+    target Spark's parser rejects) to `AS TIMESTAMP`. It must not touch the
+    same text when it appears as *data* inside a string literal -- a blind,
+    unscoped substitution would silently corrupt a query like this rather
+    than fail loudly, which is exactly the failure mode this guards
+    against.
+    """
+    from src.lakehouse.engines.spark_engine import _translate_tstz_cast
+
+    query = ("SELECT 'CAST(x AS TIMESTAMP WITH TIME ZONE)' AS note, "
+             "CAST(y AS TIMESTAMP WITH TIME ZONE) AS ts")
+    translated = _translate_tstz_cast(query)
+    assert "'CAST(x AS TIMESTAMP WITH TIME ZONE)'" in translated  # literal: untouched
+    assert "CAST(y AS TIMESTAMP)" in translated  # real cast target: translated
+    assert "TIME ZONE" not in translated.split("note,")[1]  # only the literal half keeps it
+
+
+@pytest.mark.spark
+def test_spark_engine_sql_does_not_rewrite_the_phrase_inside_a_string_literal(spark_engine):
+    """End-to-end: the query actually runs on Spark and the literal value
+    comes back byte-for-byte, proving the shim didn't corrupt it."""
+    out = spark_engine.sql(
+        "SELECT 'CAST(x AS TIMESTAMP WITH TIME ZONE)' AS note", tables={})
+    assert out.column("note")[0].as_py() == "CAST(x AS TIMESTAMP WITH TIME ZONE)"
