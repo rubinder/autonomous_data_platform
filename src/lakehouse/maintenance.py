@@ -21,6 +21,32 @@ from src.lakehouse.engines import get_engine
 
 IDENT = schemas.BRONZE_TRANSACTIONS.name
 
+# Commands that reach past `LakehouseEngine` to `engine.catalog` for PyIceberg
+# APIs the protocol does not expose (`update_schema`, `table.schemas()`,
+# `table.maintenance.expire_snapshots`). Dispatching them through `get_engine()`
+# without checking would raise a bare `AttributeError` under `ENGINE=spark`.
+#
+# Chosen fix, of the two available: **fail fast with a clear message**, rather
+# than widening the protocol with three Iceberg-specific methods and
+# implementing them twice. These are demo/maintenance commands, not pipeline
+# steps -- nothing in `make all`, `make monitor`, `make arrival`, or the agent
+# touches them -- so paying a permanent abstraction cost to make a demo
+# engine-portable buys less than it costs. The pipeline itself stays fully
+# dual-engine.
+#
+# `timetravel` and `schema-history` are NOT listed: they go through protocol
+# methods only and work on either engine.
+_CATALOG_COMMANDS = frozenset({"drift-demo", "cross-version", "expire"})
+
+
+def _require_catalog(engine, command: str) -> None:
+    if not hasattr(engine, "catalog"):
+        raise SystemExit(
+            f"maintenance: `{command}` needs direct PyIceberg catalog access "
+            f"(schema evolution, snapshot expiry, per-snapshot schema "
+            f"resolution), which {type(engine).__name__} does not expose. "
+            f"Re-run with ENGINE=pyiceberg.")
+
 
 def _fields(engine, ident: str) -> dict[str, object]:
     """Top-level fields of the table's current schema, keyed by name."""
@@ -230,6 +256,8 @@ def expire(engine, retain_last: int = 5) -> int:
 def main() -> int:
     command = sys.argv[1] if len(sys.argv) > 1 else "timetravel"
     engine = get_engine()
+    if command in _CATALOG_COMMANDS:
+        _require_catalog(engine, command)
 
     if command == "timetravel":
         for key, value in time_travel_demo(engine).items():

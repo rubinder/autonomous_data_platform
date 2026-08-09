@@ -59,8 +59,15 @@ NOISE_MERCHANTS: tuple[str, ...] = (
     "PAYROLL DIRECT DEP", "RENT PAYMENT", "CVS/PHARMACY #4410", "HOME DEPOT 6612",
 )
 
-# NYSE holidays covering START_DATE..END_DATE. Hardcoded to avoid a calendar
-# dependency that would drift with library upgrades.
+# NYSE holidays covering 2024-01-01 .. 2026-12-31 -- deliberately the whole of
+# 2026, not just START_DATE..END_DATE. The calendar is consulted past the end of
+# the data: `AS_OF_DATE` can be advanced beyond END_DATE to reproduce a stale
+# feed, and `src.ops.arrival` then expects trading days all the way up to
+# `as_of`. A calendar that stops at END_DATE makes every holiday after it look
+# like a missing trading day -- at the documented AS_OF_DATE=2026-07-31 that
+# reported 2026-07-03 (Independence Day observed, since 4 July 2026 is a
+# Saturday) as a data gap. Hardcoded to avoid a calendar dependency that would
+# drift with library upgrades.
 US_MARKET_HOLIDAYS: frozenset[date] = frozenset({
     date(2024, 1, 1), date(2024, 1, 15), date(2024, 2, 19), date(2024, 3, 29),
     date(2024, 5, 27), date(2024, 6, 19), date(2024, 7, 4), date(2024, 9, 2),
@@ -70,6 +77,11 @@ US_MARKET_HOLIDAYS: frozenset[date] = frozenset({
     date(2025, 11, 27), date(2025, 12, 25),
     date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16), date(2026, 4, 3),
     date(2026, 5, 25), date(2026, 6, 19),
+    # Past END_DATE (2026-06-30), reachable only via an advanced AS_OF_DATE:
+    date(2026, 7, 3),    # Independence Day observed (4 July 2026 is a Saturday)
+    date(2026, 9, 7),    # Labor Day
+    date(2026, 11, 26),  # Thanksgiving
+    date(2026, 12, 25),  # Christmas Day
 })
 
 

@@ -38,7 +38,14 @@ not crash the monitor, it becomes a `data_corruption` finding.
 In order:
 
 1. Type coercion — dates to `date`, timestamps to `timestamptz`, amounts to
-   `decimal(18,2)`.
+   `double`. **`double` is the weaker choice for money and is used here
+   anyway**: binary floating point cannot represent most decimal cents exactly,
+   so repeated aggregation accumulates representation error and two systems
+   summing the same column can disagree in the last cents. It is used because
+   the DuckDB/PyArrow/Iceberg round trip for `decimal(18,2)` was one more
+   moving part than this project needed, and because the analysis here is
+   correlational rather than accounting. Production would declare
+   `decimal(18,2)` end to end and reconcile against the source ledger.
 2. Deduplication on `id`, keeping the greatest `lastUpdated`, ties broken by
    greatest `_ingested_at`. Late-arriving corrections win.
 3. `signed_amount = -amount WHEN baseType='DEBIT' ELSE amount`. Source amounts

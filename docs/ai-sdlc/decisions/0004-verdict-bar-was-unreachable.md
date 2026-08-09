@@ -39,8 +39,9 @@ it was only visible because someone recomputed rather than read the table.
 ## Two overclaiming bugs in the same file
 
 - `report.py` rationalised the loss with a lag/beta narrative the data
-  contradicts — CMG has the shortest planted lag *and* the highest beta and still
-  loses. An explanation that the data refutes is worse than no explanation.
+  contradicts — CMG has the highest planted beta and the shortest planted lag
+  (2 trading days, tied with DPZ) and still loses. An explanation that the data
+  refutes is worse than no explanation.
 - ULTA printed "beats ARIMA" on IC −0.007 against ARIMA's IC −0.118. ARIMA is
   anti-skilled here (on LULU its RMSE is 0.0955 against persistence's 0.0581), so
   "beats" against a broken baseline reads as success while describing two

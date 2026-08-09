@@ -73,6 +73,57 @@ def test_assert_valid_raises_on_violation(contract):
     assert "unique" in str(exc.value)
 
 
+def test_nullable_false_is_enforced_without_an_explicit_not_null(contract):
+    """`signed_amount` is `nullable: false` and has no `not_null` expectation.
+
+    Before this, `nullable` was parsed into `SchemaField` and then never read,
+    so a Silver table whose `signed_amount` was 100% NULL passed the entire
+    contract: `not_null` was not declared for it and `range` treated "no
+    values" as nothing to complain about.
+    """
+    field = next(f for f in contract.schema_fields if f.name == "signed_amount")
+    assert field.nullable is False
+    assert not any(e.get("type") == "not_null" and e.get("column") == "signed_amount"
+                   for e in contract.expectations)
+
+    tbl = _table()
+    tbl = tbl.set_column(tbl.schema.get_field_index("signed_amount"),
+                         "signed_amount", pa.array([None, None, None], pa.float64()))
+    report = validator.validate(tbl, contract, as_of=date(2026, 6, 30))
+    assert not report.passed
+    assert any(f.kind == "not_null" and f.column == "signed_amount"
+               for f in report.failures)
+
+
+def test_all_null_column_fails_assert_valid(contract):
+    """The end-to-end version: the build must actually abort, not just report."""
+    tbl = _table()
+    tbl = tbl.set_column(tbl.schema.get_field_index("signed_amount"),
+                         "signed_amount", pa.array([None, None, None], pa.float64()))
+    with pytest.raises(validator.ContractViolation):
+        validator.assert_valid(tbl, contract, as_of=date(2026, 6, 30))
+
+
+def test_range_on_an_all_null_column_fails_rather_than_passing_silently(contract):
+    """A column with nothing in it is not a column that is in range.
+
+    `freshness` already fails on "no values"; `range` used to return pass,
+    which is the empty-delta blind spot in miniature -- reporting fine exactly
+    when the data is most obviously broken.
+    """
+    range_only = validator.Contract(
+        table="t", version=1, owner="test", schema_fields=(),
+        expectations=({"type": "range", "column": "signed_amount",
+                       "min": -100000, "max": 100000},))
+    tbl = _table()
+    tbl = tbl.set_column(tbl.schema.get_field_index("signed_amount"),
+                         "signed_amount", pa.array([None, None, None], pa.float64()))
+    report = validator.validate(tbl, range_only, as_of=date(2026, 6, 30))
+    assert not report.passed
+    failure = next(f for f in report.failures if f.kind == "range")
+    assert "no values" in failure.detail
+
+
 def test_report_records_observed_values(contract):
     report = validator.validate(_table(ids=(1, 1, 2)), contract, as_of=date(2026, 6, 30))
     dup = next(f for f in report.failures if f.kind == "unique")

@@ -38,8 +38,9 @@ A complete data platform, built end to end, small enough to read:
   feature independently recomputed by a second implementation on every training
   row.
 - **An agentic ops layer** — LangGraph, rules-first, dry-run by default, offline.
-- **17 data-quality monitors + 9 arrival checks** with persisted metric history
-  and robust (median/MAD) baselines.
+- **17 data-quality monitors + 8 arrival checks** with persisted metric history
+  and robust (median/MAD) baselines. 10 of the 17 are declared in YAML; the
+  other 7 are column-type checks generated per contract field.
 - **The AI-SDLC record** — the spec, the plan, every task brief, every review
   diff, and a ledger of what was found and changed. See
   [`docs/ai-sdlc/`](docs/ai-sdlc/workflow.md).
@@ -162,8 +163,8 @@ uv run make lint           # ruff
 | Target | What it does |
 |---|---|
 | `make all` | `bronze silver gold forecast` end to end, offline, deterministic |
-| `make monitor` | 17 data-quality checks; persists metrics to `ops.monitor_results` |
-| `make arrival` | 9 checks across 3 arrival SLAs, on the NYSE trading calendar |
+| `make monitor` | 17 data-quality checks; persists metrics to `ops.monitor_results` and routes alerts to `ops.alert_log` (**dry-run** unless `--execute`) |
+| `make arrival` | 8 checks across 3 arrival SLAs, on the NYSE trading calendar |
 | `make agent` | the LangGraph ops agent (**dry-run** unless `--execute`) |
 | `make schema-history` | every schema version with field ids |
 | `make cross-version` | one query spanning snapshots written under different schemas |
@@ -183,9 +184,18 @@ ENGINE=spark uv run make silver         # opt-in Spark path (needs Java + Maven 
 To see the whole story in order:
 
 ```bash
-uv run make all && uv run make monitor && uv run make agent   # clean: 0 findings
-uv run make drift-demo && uv run make agent                   # after drift: 5 findings, 2 incidents
+uv run make all && uv run make agent          # clean: 0 findings
+uv run make drift-demo && uv run make agent   # after drift: 5 findings, 2 incidents
 ```
+
+Both transcripts below are from that exact sequence, on a warehouse with no
+`ops.monitor_results` history. Slot a `make monitor` in before `drift-demo` and
+the post-drift run reports **6** findings and 3 incidents, not 5 and 2: the
+persisted baseline of 250,000 added records lets `bronze_txn_row_count` breach
+as well, which the agent folds in as a `monitor_breach` finding on top of the
+volume anomaly its own sensor already found. That is the monitors working, not
+a discrepancy — but the count depends on the history in the warehouse, so the
+sequence that produced a number is stated with it.
 
 ### Dual engine
 
@@ -205,6 +215,18 @@ Gold.** The abstraction is proven where it was tested. The Spark path also needs
 Maven Central for the Iceberg JAR, so unlike the PyIceberg path it is not
 offline. Without PySpark installed the parity tests skip cleanly and
 `spark_engine.py` is never imported.
+
+**Three maintenance commands are PyIceberg-only, and now say so.**
+`drift-demo`, `cross-version`, and `expire` reach past the protocol to
+`engine.catalog` for APIs it does not expose (`update_schema`, per-snapshot
+`table.schemas()`, `expire_snapshots`). They used to fail under `ENGINE=spark`
+with a bare `AttributeError` from inside a helper; they now stop with a message
+naming the command and telling you to use `ENGINE=pyiceberg`. Widening the
+protocol by three Iceberg-specific methods and implementing them twice was the
+alternative, and it buys a portable *demo* at the cost of a permanently larger
+interface — the pipeline itself (`make all`, `monitor`, `arrival`, the agent)
+stays fully dual-engine either way. `timetravel` and `schema-history` use
+protocol methods only and work on both.
 
 ## Schema evolution and cross-version queries
 
@@ -310,13 +332,24 @@ layers address that
 ```console
 $ uv run make monitor
 monitors: 17 checks at as_of=2026-06-30 — 0 breach, 0 warn
+monitors: no alertable results, nothing routed
 ```
 
-Checks are declared in `monitors/{bronze,silver,gold}.yaml`. Every run writes
-`monitor_name`, `metric`, `baseline_median`, `status`, and `as_of` to
-`ops.monitor_results`, and baselines are read back from that table — the history
-is persisted, not re-derived from the snapshot log. The first run records with
-`no baseline yet` and cannot breach.
+**Where the 17 come from, precisely.** Ten are declared in
+`monitors/{bronze,silver,gold}.yaml` (2 bronze / 6 silver / 2 gold) as a SQL
+query plus a judging rule — for those, adding a check really is a data change,
+not a code change. The other seven are column-type checks generated in Python,
+one per field of the two typed contracts, and they carry **`metric=None`**:
+a declared type either matches the physical Arrow type or it does not, so there
+is no number to trend. Baselines are read with `metric IS NOT NULL`, which is
+why those seven never contribute to one.
+
+Every run writes `monitor_name`, `metric`, `baseline_median`, `status`, and
+`as_of` to `ops.monitor_results`, and baselines are read back from that table —
+the history is persisted, not re-derived from the snapshot log. The first run
+records with `no baseline yet` and cannot breach. A `kind:` the evaluator does
+not recognise raises rather than returning `ok`, so a YAML typo cannot mint a
+permanently-passing check.
 
 **Robust z-scores (median/MAD), not mean/stddev.** One prior outlier inflates σ
 enough to hide the next real shift. Measured on a baseline of twenty ~100 values
@@ -337,30 +370,60 @@ PyIceberg commits an `overwrite()` as a `delete` + plain `append` pair with
 **neither half tagged `operation="overwrite"`**, so an added-records monitor
 would read every rebuild as a spike.
 
-### `make arrival` — 9 checks across 3 SLAs, on the trading calendar
+### `make arrival` — 8 checks across 3 SLAs, on the trading calendar
 
-Three checks — lag, specific missing periods, partial-arrival thinness — over
-three tables. At `as_of=2026-06-30` all nine are `ok`. Advancing the logical
-clock past the data reproduces a stale feed without waiting for one; **6 of the 9
-checks breach**, one table's three lines shown:
+Lag and specific-missing-periods over three tables, plus partial-arrival
+thinness over the two that have one. At `as_of=2026-06-30` all eight are `ok`.
+Advancing the logical clock past the data reproduces a stale feed without
+waiting for one; **6 of the 8 checks breach**, one table's lines shown:
 
 ```console
 $ AS_OF_DATE=2026-07-31 uv run make arrival
 [X] silver.transactions_arrival_lag: newest 2026-06-30 is 31d behind as_of 2026-07-31 (limit 3d)
-[X] silver.transactions_arrival_gap: 23 missing period(s): 2026-07-01, 2026-07-02, 2026-07-03, 2026-07-06, 2026-07-07
-[ ] silver.transactions_arrival_partial: all periods complete
+[X] silver.transactions_arrival_gap: 22 missing period(s): 2026-07-01, 2026-07-02, 2026-07-06, 2026-07-07, 2026-07-08
 ```
 
 Gaps are computed against the NYSE trading calendar, so **weekends and holidays
-are correctly not gaps** — verified for Saturdays and Memorial Day 2026-05-25.
-The three `arrival_partial` checks stay `ok`: the July days are absent, not thin.
-Naming 23 specific missing dates is materially more actionable than reporting a
-lag number, and getting there required fixing a plan defect that made
-post-newest gaps structurally unreachable.
+are correctly not gaps** — pinned by tests for Saturdays, Memorial Day
+2026-05-25, and holidays past the end of the data. That last case was a real
+bug found in final review: the holiday set stopped at `END_DATE` (2026-06-30)
+while the gap window runs to `as_of`, so **2026-07-03 — Independence Day
+observed, because 4 July 2026 is a Saturday — was listed as a missing trading
+day**, three lines above the claim that holidays are not gaps. The count was 23;
+it is 22. Naming 22 specific missing dates is materially more actionable than
+reporting a lag number, and getting there required fixing a plan defect that
+made post-newest gaps structurally unreachable.
+
+**Eight, not nine.** Two of the original nine were `arrival_partial` checks with
+`min_rows_per_period: 1` against a `count(*)` GROUP BY — a period that appears
+at all appears with at least one row, so `observed[d] < 1` is unsatisfiable and
+those two checks could never fire while displaying as passing every run. They
+are gone. The two that remain guard a real structural floor: one price row, and
+one training row, per company per trading day. `silver.transactions` has no such
+floor and asserts nothing; its volume is watched by the trailing-median monitors
+instead.
 
 Alerts throttle on a `hashlib`-derived key that is stable across processes and
 logged to `ops.alert_log`: consecutive identical alerts produce one delivery and
-one throttle; distinct alerts never throttle each other.
+one throttle; distinct alerts never throttle each other. **`make monitor` is the
+production caller** — every run routes its `warn`/`breach` results and writes the
+log, dry-run unless `--execute`:
+
+```console
+$ uv run make drift-demo && uv run make monitor
+monitors: 17 checks at as_of=2026-06-30 — 1 breach, 0 warn
+  [breach] bronze_txn_row_count: 5 is 0% of trailing median 250000
+  -> DRY-RUN: BREACH -> [breach] bronze_txn_row_count on bronze.yodlee_transactions_raw
+monitors: alert routing is dry-run (pass --execute to mark alerts delivered)
+
+$ uv run make monitor                      # same breach, second run
+  -> throttled: [breach] bronze_txn_row_count on bronze.yodlee_transactions_raw (seen in last 3 run(s))
+```
+
+That wiring is newer than the description of it. Until the final review
+`src/ops/alerts.py` had **no production caller at all**: `ops.alert_log` was
+declared in `schemas.ALL_TABLES`, created by nothing, and written up here as
+live behaviour on the strength of its unit tests. It runs now.
 
 ## The agentic ops layer
 
@@ -410,8 +473,18 @@ same two files instead of accumulating duplicates. Committed examples are in
 
 The rename classified as `breaking` is the right answer, not noise: Silver reads
 Bronze by name and the contract declares columns by name, so a rename *is* a drop
-to every consumer even though Iceberg lost nothing. Storage fine, consumers
-broken — exactly what a human should review.
+to every consumer that selects it, even though Iceberg lost nothing. Storage
+fine, consumers broken — exactly what a human should review.
+
+The incident file is careful about *which* consumers, and that took a fix. The
+generated reasoning used to end "its absence will fail the next Silver build",
+which for `checkNumber` was simply false — Silver never selects that column, and
+nothing validates the Bronze contract at build time. The classifier sees one
+table and one contract; it cannot know who reads what, so it now states what it
+does know (the published contract is violated, and by-name consumers break) and
+hands the blast-radius question to a human. An agent that fabricates a
+downstream consequence to sound confident is worse than one that says it does
+not know.
 
 Of the design's five drift scenarios, four are reproduced end-to-end against a
 real Iceberg table; type *narrowing* is covered by unit test only, because
@@ -511,8 +584,14 @@ spec ──▶ plan ──▶ per-task implementer (fresh context)
   wrote a *third* independent implementation of the feature computation to
   cross-check the other two; others used mutation testing to find tests that
   passed vacuously — two were found and rewritten.
-- **13 review-driven follow-up commits** across 33 total; 11 of 19 tasks needed
-  at least one fix round, and two needed two, because fixes introduce bugs.
+- **14 review-driven follow-up commits** across 35 total; 11 of the 20 tasks
+  needed at least one fix round, and two needed two, because fixes introduce
+  bugs. The last of the 14 came from a whole-branch review after every task was
+  green: it found a crash-on-malformed-date on the agent's own entry path, a
+  holiday calendar that had run out underneath a documented command, an alerting
+  module with no production caller, and four documents claiming more than the
+  code did. Per-task review does not catch what only shows up when the parts are
+  read together.
 
 **Several of the defects were in the plan, not the code** — the most interesting
 finding of the whole exercise. A faithful implementer produces working code that
@@ -623,7 +702,8 @@ production build that must be reproducible in an air-gapped environment.
 
 ```
 ├── contracts/*.yaml          data contracts (pipeline + agent read the same file)
-├── monitors/*.yaml           17 data-quality checks
+├── monitors/*.yaml           10 SQL data-quality checks (+7 column-type checks
+│                             generated per contract field in src/ops/monitors.py)
 ├── docs/
 │   ├── architecture/         ADR-0001 .. ADR-0007
 │   ├── ai-sdlc/              workflow.md, decisions/, prompts/

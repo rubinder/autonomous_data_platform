@@ -101,6 +101,37 @@ def test_workflow_comments_match_the_scale_they_run(workflow):
     )
 
 
+def test_the_missing_date_count_is_quoted_consistently():
+    """One number, two documents, and it was wrong in both.
+
+    The arrival gap headline was 23, which included 2026-07-03 -- a NYSE
+    holiday the calendar had run out before reaching. Corrected to 22. This
+    pins the two places that quote it to each other so they cannot drift
+    apart again, and refuses the old value outright.
+    """
+    readme = (config.REPO_ROOT / "README.md").read_text()
+    adr = next((DOCS / "architecture").glob("ADR-0007-*.md")).read_text()
+
+    assert "22 missing period(s)" in readme
+    assert "22 specific missing trading dates" in adr
+    for text, name in ((readme, "README"), (adr, "ADR-0007")):
+        assert "23 missing" not in text, f"{name} still quotes the old count"
+        assert "23 specific" not in text, f"{name} still quotes the old count"
+
+
+def test_the_holiday_calendar_covers_the_documented_as_of_override():
+    """The README tells the reader to run AS_OF_DATE=2026-07-31.
+
+    If the calendar does not reach that far, the documented command prints
+    holidays as data gaps.
+    """
+    from datetime import date
+
+    readme = (config.REPO_ROOT / "README.md").read_text()
+    assert "AS_OF_DATE=2026-07-31" in readme
+    assert max(config.US_MARKET_HOLIDAYS) >= date(2026, 7, 31)
+
+
 def test_every_adr_referenced_by_the_readme_exists():
     text = (config.REPO_ROOT / "README.md").read_text()
     referenced = {f"ADR-{n:04d}" for n in range(1, 8) if f"ADR-{n:04d}" in text}

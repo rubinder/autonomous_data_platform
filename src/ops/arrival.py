@@ -22,14 +22,31 @@ class ArrivalSLA:
     date_column: str
     calendar: str          # "trading" or "daily"
     max_lag_days: int
-    min_rows_per_period: int
+    # Rows expected per period, for tables with a *structural* per-period row
+    # count. `None` means "no meaningful floor", and the partial-arrival check
+    # is skipped rather than reported.
+    #
+    # This must never be 1. `observed` is built from a `count(*)` GROUP BY, so
+    # a period that appears at all appears with at least one row and
+    # `observed[d] < 1` is unsatisfiable by construction -- the same species of
+    # defect as the `SELECT 0.0` quarantine monitor: a check that cannot fire,
+    # displayed as a passing check on every run. Two of the three SLAs used to
+    # carry exactly that.
+    min_rows_per_period: int | None
 
 
 ARRIVAL_SLAS: tuple[ArrivalSLA, ...] = (
-    ArrivalSLA("silver.transactions", "txn_date", "trading", 3, 1),
+    # silver.transactions has no structural floor -- transactions per day is a
+    # volume, not a shape, and it varies with N_TRANSACTIONS. Thinness there is
+    # what the volume monitors in `monitors/silver.yaml` measure against a
+    # trailing median; there is nothing honest to assert here, so nothing is.
+    ArrivalSLA("silver.transactions", "txn_date", "trading", 3, None),
+    # One price row per company per trading day, by construction.
     ArrivalSLA("silver.stock_prices", "trade_date", "trading", 3,
                len(config.COMPANIES)),
-    ArrivalSLA("gold.forecast_training_set", "trade_date", "trading", 5, 1),
+    # One training row per company per trading day, joined from the above.
+    ArrivalSLA("gold.forecast_training_set", "trade_date", "trading", 5,
+               len(config.COMPANIES)),
 )
 
 
@@ -94,14 +111,15 @@ def check_arrival(engine, sla: ArrivalSLA, as_of: date,
          f"{', '.join(str(d) for d in gaps[:5])}") if gaps
         else "no gaps in the expected calendar", as_of))
 
-    thin = [d for d in expected
-            if d in observed and observed[d] < sla.min_rows_per_period]
-    results.append(MonitorResult(
-        f"{sla.table}_arrival_partial", sla.table, sla.date_column,
-        "arrival_partial", float(len(thin)), None,
-        "warn" if thin else "ok",
-        (f"{len(thin)} period(s) below {sla.min_rows_per_period} rows")
-        if thin else "all periods complete", as_of))
+    if sla.min_rows_per_period is not None:
+        thin = [d for d in expected
+                if d in observed and observed[d] < sla.min_rows_per_period]
+        results.append(MonitorResult(
+            f"{sla.table}_arrival_partial", sla.table, sla.date_column,
+            "arrival_partial", float(len(thin)), None,
+            "warn" if thin else "ok",
+            (f"{len(thin)} period(s) below {sla.min_rows_per_period} rows")
+            if thin else "all periods complete", as_of))
 
     return results
 

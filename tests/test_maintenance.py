@@ -95,3 +95,30 @@ def test_expire_is_a_no_op_when_history_is_short(engine):
     before = engine.snapshots(schemas.BRONZE_TRANSACTIONS.name)
     assert maintenance.expire(engine, retain_last=5) == 0
     assert engine.snapshots(schemas.BRONZE_TRANSACTIONS.name) == before
+
+
+def test_catalog_only_commands_fail_with_a_clear_message(monkeypatch):
+    """`main()` dispatches through `get_engine()`, but drift-demo,
+    cross-version and expire reach past the protocol to `engine.catalog` for
+    PyIceberg APIs the protocol does not expose. Under an engine without one
+    that used to be a bare `AttributeError` from deep inside a helper.
+    """
+    class NoCatalogEngine:
+        pass
+
+    engine = NoCatalogEngine()
+    for command in sorted(maintenance._CATALOG_COMMANDS):
+        with pytest.raises(SystemExit) as exc:
+            maintenance._require_catalog(engine, command)
+        message = str(exc.value)
+        assert command in message
+        assert "ENGINE=pyiceberg" in message
+
+    # Protocol-only commands must not be gated.
+    assert "timetravel" not in maintenance._CATALOG_COMMANDS
+    assert "schema-history" not in maintenance._CATALOG_COMMANDS
+
+
+def test_catalog_backed_engine_passes_the_guard(engine):
+    for command in maintenance._CATALOG_COMMANDS:
+        maintenance._require_catalog(engine, command)   # must not raise

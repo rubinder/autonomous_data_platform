@@ -56,3 +56,65 @@ def test_max_txn_date_feeds_as_of_resolution(engine):
     bronze.ingest_all(engine, n_transactions=2000)
     from src import config
     assert bronze.max_txn_date(engine) <= config.END_DATE
+
+
+def _append_malformed_txn_date(engine, value: str) -> None:
+    """Append one Bronze row whose transactionDate is not a date at all.
+
+    Bronze does no type coercion, so this is expected input, not a fixture
+    contrivance -- it is exactly what an upstream feed change looks like here.
+    """
+    ident = schemas.BRONZE_TRANSACTIONS.name
+    row = engine.scan_arrow(ident).slice(0, 1)
+    idx = row.schema.get_field_index("transactionDate")
+    row = row.set_column(idx, "transactionDate",
+                         pa.array([value], row.schema.field(idx).type))
+    engine.append(ident, row)
+
+
+def test_max_txn_date_survives_a_malformed_high_sorting_value(engine):
+    """The bug this pins: `SELECT max(transactionDate)` picks the garbage.
+
+    "zzz-not-a-date" sorts lexicographically above every real "20XX-..."
+    string, so a SQL MAX returns it and `date.fromisoformat` raises. Because
+    `max_txn_date` resolves AS_OF_DATE for silver, monitor, arrival and the
+    agent, that one row took out four entry points at once.
+    """
+    bronze.ingest_all(engine, n_transactions=2000)
+    real_max = bronze.max_txn_date(engine)
+
+    _append_malformed_txn_date(engine, "zzz-not-a-date")
+
+    assert bronze.max_txn_date(engine) == real_max
+
+
+def test_max_txn_date_survives_a_malformed_low_sorting_value(engine):
+    bronze.ingest_all(engine, n_transactions=2000)
+    real_max = bronze.max_txn_date(engine)
+    _append_malformed_txn_date(engine, "")
+    _append_malformed_txn_date(engine, "0000-13-45")
+    assert bronze.max_txn_date(engine) == real_max
+
+
+def test_agent_entry_path_survives_a_malformed_transaction_date(engine, tmp_path,
+                                                                monkeypatch):
+    """`make agent`'s first act is to resolve AS_OF_DATE via max_txn_date.
+
+    `graph.run()` calls it *before* the graph starts, so the sensor hardening
+    that already tolerates this input never gets the chance to run. This
+    asserts the shipped entry path, not just the helper.
+    """
+    from src.agent import actions, graph
+
+    # The agent's `act` node writes into the repo's real docs/incidents/.
+    # A test must not dirty the committed artifact set.
+    monkeypatch.setattr(actions, "INCIDENTS_DIR", tmp_path / "incidents")
+
+    bronze.ingest_all(engine, n_transactions=2000)
+    clean = graph.run(engine=engine, dry_run=True)["as_of"]
+
+    _append_malformed_txn_date(engine, "zzz-not-a-date")
+
+    state = graph.run(engine=engine, dry_run=True)
+    assert state["as_of"] == clean
+    assert any(f.kind == "data_corruption" for f in state["findings"])

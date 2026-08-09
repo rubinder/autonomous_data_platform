@@ -25,7 +25,12 @@ agent -- the worst failure mode here, since a monitor that crashes on bad
 data stops monitoring at exactly the moment something has gone wrong.
 `observe()` instead parses every value, keeps the max of only the ones that
 parse, and counts the rest as `unparseable_date_count`; `detect()` turns a
-nonzero count into its own `Finding` rather than silently dropping it.
+nonzero count into its own `Finding` rather than silently dropping it. That
+pattern lives in `src.dates.max_parseable_date` as a single shared
+implementation -- `bronze.max_txn_date`, which resolves AS_OF_DATE before the
+agent graph starts, uses the same one, because a second hand-rolled copy of
+this logic is exactly how the crash came back on a path the sensor could not
+protect.
 
 Volume is compared per snapshot, not on the table's cumulative row count.
 Bronze is append-only, so its total row count only ever grows -- comparing
@@ -38,6 +43,8 @@ from __future__ import annotations
 import statistics
 from dataclasses import dataclass, field
 from datetime import date
+
+from src import dates
 
 VOLUME_COLLAPSE_RATIO = 0.5  # below half the trailing median is an incident
 
@@ -94,16 +101,8 @@ def observe(engine, table_def, date_column: str | None = None) -> ObservedState:
     if date_column and date_column in columns:
         arrow = engine.scan_arrow(ident)
         if date_column in arrow.column_names:
-            parsed: list[date] = []
-            for value in arrow.column(date_column).to_pylist():
-                if value is None:
-                    continue
-                try:
-                    parsed.append(_to_date(value))
-                except (ValueError, TypeError):
-                    unparseable += 1
-            if parsed:
-                newest = max(parsed)
+            newest, unparseable = dates.max_parseable_date(
+                arrow.column(date_column).to_pylist())
 
     return ObservedState(
         table=ident,
@@ -114,12 +113,6 @@ def observe(engine, table_def, date_column: str | None = None) -> ObservedState:
         newest_date=newest,
         unparseable_date_count=unparseable,
     )
-
-
-def _to_date(value) -> date:
-    if isinstance(value, str):
-        return date.fromisoformat(value)
-    return value.date() if hasattr(value, "date") else value
 
 
 def detect(state: ObservedState, contract, as_of: date,

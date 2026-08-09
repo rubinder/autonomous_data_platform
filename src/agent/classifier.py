@@ -59,9 +59,19 @@ def classify(finding: Finding) -> tuple[str, str]:
                 "adding to the contract, not worth paging anyone.")
 
         if change == "dropped":
+            # Deliberately no claim about which downstream job breaks. The
+            # classifier sees one table and one contract; it does not know
+            # which columns any consumer selects, so "this will fail the next
+            # Silver build" is a guess dressed as evidence -- and for
+            # `checkNumber` it was simply false, since Silver never selects
+            # it. What *is* known and sufficient: the declared contract is
+            # violated, and name-based consumers of this column break.
             return "breaking", (
-                f"Column '{column}' is declared in the contract and consumed "
-                "downstream. Its absence will fail the next Silver build.")
+                f"Column '{column}' is declared in the contract but is absent "
+                "from the table, so the published contract is violated. Any "
+                "consumer that selects it by name breaks; which consumers "
+                "those are is not visible from this table's metadata and "
+                "needs a human to confirm.")
 
         if change == "type_changed":
             declared = finding.evidence.get("declared_type", "")

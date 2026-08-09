@@ -9,7 +9,9 @@ import sys
 
 import pyarrow as pa
 
-from src.lakehouse import schemas
+from src import config
+from src.contracts import validator
+from src.lakehouse import bronze, schemas
 from src.lakehouse.engines import get_engine
 
 SPEND_SQL = """
@@ -188,8 +190,20 @@ def build_all(engine) -> dict[str, int]:
     }
     # After the marts: the training set reads gold_spend and gold_features back
     # out of the catalog, so both must be committed first.
+    training = build_training_set(engine)
+
+    # Gold fails closed too, on the same terms as Silver: validate before the
+    # write so a violation leaves the table absent rather than half-correct.
+    # Until this call existed, `contracts/gold_forecast_training_set.yaml` was
+    # read by the type monitor and by nothing else -- four expectations that
+    # no build path evaluated.
+    as_of = config.resolve_as_of_date(bronze.max_txn_date(engine))
+    contract = validator.load_contract(
+        validator.CONTRACTS_DIR / "gold_forecast_training_set.yaml")
+    validator.assert_valid(training, contract, as_of)
+
     counts[schemas.GOLD_TRAINING.name] = _write(
-        engine, schemas.GOLD_TRAINING, build_training_set(engine))
+        engine, schemas.GOLD_TRAINING, training)
     return counts
 
 

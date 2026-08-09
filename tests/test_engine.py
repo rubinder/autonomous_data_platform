@@ -161,7 +161,7 @@ def test_arrow_schema_tracks_the_live_table_not_the_table_def(engine):
 
 
 def test_every_table_definition_creates(engine):
-    """All 12 schemas and partition specs must survive a real catalog commit."""
+    """All 14 schemas and partition specs must survive a real catalog commit."""
     for td in schemas.ALL_TABLES:
         engine.create_table(td)
         assert engine.table_exists(td.name)

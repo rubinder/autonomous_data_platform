@@ -85,6 +85,17 @@ def validate(table: pa.Table, contract: Contract, as_of: date) -> ValidationRepo
             "schema_present", sf.name, present,
             observed=present, detail="" if present else "column missing"))
 
+        # `nullable: false` is a declaration, so it has to be a check. Parsing
+        # it and never reading it is worse than not having it: a Silver table
+        # whose `signed_amount` is 100% NULL passed this whole contract,
+        # because `not_null` happened not to be listed for that column and
+        # `range` treats "no values" as nothing to complain about.
+        if present and not sf.nullable:
+            nulls = table.column(sf.name).null_count
+            report.results.append(ExpectationResult(
+                "not_null", sf.name, nulls == 0, nulls,
+                f"{nulls} null(s) in a column declared nullable: false"))
+
     for exp in contract.expectations:
         report.results.append(_evaluate(table, exp, as_of))
 
@@ -123,7 +134,14 @@ def _evaluate(table: pa.Table, exp: dict, as_of: date) -> ExpectationResult:
     if kind == "range":
         values = [v for v in col.to_pylist() if v is not None]
         if not values:
-            return ExpectationResult(kind, column, True, None)
+            # A column with nothing in it is not a column that is in range.
+            # Passing here is the empty-delta blind spot in miniature: the
+            # check reports "fine" precisely when the data is most obviously
+            # broken. `freshness` already fails on "no values"; this now
+            # matches it.
+            return ExpectationResult(
+                kind, column, False, None,
+                "no values to range-check (column is entirely NULL or empty)")
         lo, hi = min(values), max(values)
         ok = lo >= exp.get("min", float("-inf")) and hi <= exp.get("max", float("inf"))
         return ExpectationResult(kind, column, ok, (lo, hi))

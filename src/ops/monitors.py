@@ -69,10 +69,24 @@ def load_monitors(path: Path | None = None) -> list[MonitorDef]:
     return defs
 
 
+KINDS = frozenset({"row_count", "cardinality", "distribution_shift",
+                   "null_rate", "duplicate_rate"})
+
+
 def evaluate(metric: float, baseline: list[float],
              params: dict) -> tuple[str, str]:
     """Judge a metric against its own history. Returns (status, detail)."""
     kind = params.get("kind", "row_count")
+
+    # Checked first, before the no-baseline and absolute-limit shortcuts, so
+    # an unrecognised kind cannot slip through on a monitor's first run. It
+    # used to fall through to a bare "ok" at the bottom of this function: one
+    # typo in a YAML `kind:` produced a check that was counted, displayed
+    # green, and evaluated nothing, forever.
+    if kind not in KINDS:
+        raise ValueError(
+            f"unknown monitor kind: {kind!r} (expected one of "
+            f"{', '.join(sorted(KINDS))})")
 
     absolute = params.get("max_absolute")
     if absolute is not None and metric > absolute:
@@ -135,7 +149,10 @@ def evaluate(metric: float, baseline: list[float],
         return ("ok", f"{metric:g} duplicates") if metric == 0 else (
             "breach", f"{metric:g} duplicate key(s)")
 
-    return "ok", f"{metric:g}"
+    # Unreachable: `kind` was checked against KINDS on entry. Kept as a hard
+    # stop so adding a name to KINDS without adding its branch fails loudly
+    # rather than reverting to the permanently-passing behaviour above.
+    raise ValueError(f"monitor kind {kind!r} has no evaluation branch")
 
 
 def latest_incremental_added_rows(engine, ident: str) -> float:
@@ -177,16 +194,24 @@ _TYPE_MAP: dict[str, tuple[str, ...]] = {
 }
 
 
-def check_column_types(engine, table_def, contract) -> list[MonitorResult]:
+def check_column_types(engine, table_def, contract,
+                       as_of: date | None = None) -> list[MonitorResult]:
     """Physical Arrow types vs the contract's declared types.
 
     Catches silent coercion -- a column that arrives as string where the
     contract declares double still passes every value-level expectation while
     breaking every arithmetic consumer downstream.
+
+    `as_of` is the run's logical clock and should always be passed by
+    production callers. It used to be re-derived here as
+    `resolve_as_of_date(None)`, which ignores the caller's as_of entirely and
+    falls back to `END_DATE` -- so these seven results were stamped with a
+    different `run_at` than the other ten in the same run, splitting one run
+    into two `run_at` values in `ops.monitor_results`.
     """
     arrow = engine.scan_arrow(table_def.name)
     actual = {f.name: str(f.type) for f in arrow.schema}
-    run_at = config.resolve_as_of_date(None)
+    run_at = as_of if as_of is not None else config.resolve_as_of_date(None)
     results: list[MonitorResult] = []
 
     for field in contract.schema_fields:

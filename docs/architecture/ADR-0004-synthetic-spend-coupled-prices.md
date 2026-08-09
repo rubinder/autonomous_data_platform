@@ -70,7 +70,11 @@ the **argmax lag equals the configured lag for all six tickers**.
 **Positive.**
 
 - `make all` is deterministic and offline: same seed, byte-identical output,
-  verified across processes.
+  verified across processes — and pinned there by
+  `test_deterministic_across_separate_processes`, which generates in two
+  interpreters under `PYTHONHASHSEED=random` and compares digests. The
+  same-process version of that test passes whether the claim is true or not
+  ([0002](../ai-sdlc/decisions/0002-stable-merchant-hash.md)).
 - The leakage tests mean something. Purged walk-forward CV, the no-lookahead
   recomputation, and the "if all six beat the baseline, stop and investigate"
   canary are all only interpretable because ground truth is known.

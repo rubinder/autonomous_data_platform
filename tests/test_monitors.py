@@ -101,6 +101,46 @@ def test_constant_baseline_does_not_divide_by_zero():
     assert status == "ok"
 
 
+def test_unknown_kind_raises_instead_of_reporting_ok():
+    """One typo in a YAML `kind:` used to mint a permanently-passing monitor.
+
+    Falling through to "ok" is the worst available outcome: the check is
+    counted, displayed green, and evaluates nothing.
+    """
+    with pytest.raises(ValueError, match="unknown monitor kind"):
+        monitors.evaluate(metric=1.0, baseline=[1.0, 2.0],
+                          params={"kind": "row_cont"})  # typo
+
+
+def test_a_typo_in_kind_surfaces_as_a_breach_not_a_pass(engine, tmp_path):
+    """`runner` must convert that raise into a visible breach, not a crash."""
+    (tmp_path / "typo.yaml").write_text(
+        "- name: typo_monitor\n"
+        "  table: silver.transactions\n"
+        "  kind: row_cont\n"
+        "  query: SELECT count(*) AS metric FROM t\n")
+    results = runner.run_monitors(engine, as_of=date(2026, 6, 30),
+                                  monitor_dir=tmp_path)
+    typo = next(r for r in results if r.monitor == "typo_monitor")
+    assert typo.status == "breach"
+    assert "unknown monitor kind" in typo.detail
+
+
+def test_column_type_results_are_stamped_with_the_runs_as_of(engine):
+    """These seven results used to re-derive `run_at` from the environment.
+
+    `resolve_as_of_date(None)` ignores the caller's as_of and falls back to
+    END_DATE, so one monitor run landed in `ops.monitor_results` under two
+    different `run_at` values.
+    """
+    as_of = date(2024, 3, 15)
+    results = runner.run_monitors(engine, as_of=as_of)
+    typed = [r for r in results if r.kind == "column_type"]
+    assert typed
+    assert {r.run_at for r in typed} == {as_of}
+    assert {r.run_at for r in results} == {as_of}
+
+
 def test_column_type_conformance_passes_on_clean_silver(engine):
     from src.contracts import validator
     contract = validator.load_contract(

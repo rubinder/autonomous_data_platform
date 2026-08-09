@@ -20,7 +20,7 @@ three reasons specific to this design:
    to ask "which declared columns are missing from the live table, and which
    live columns are undeclared?"
 2. **Machinery weight.** GE brings a context directory, datasource
-   configuration, store backends, and a plugin surface. At four contracts and
+   configuration, store backends, and a plugin surface. At three contracts and
    seven expectation types, that is more configuration than the thing being
    configured.
 3. **Freshness semantics.** This project requires freshness evaluated against a
@@ -29,31 +29,52 @@ three reasons specific to this design:
 
 ## Decision
 
-Four YAML contracts in `contracts/`, evaluated by ~200 lines in
+Three YAML contracts in `contracts/` — `bronze_yodlee_transactions`,
+`silver_transactions`, `gold_forecast_training_set` — evaluated by ~200 lines in
 `src/contracts/validator.py`, returning a `ValidationReport` with per-expectation
 pass/fail, observed values, and affected row counts.
 
 ```yaml
 table: silver.transactions
-version: 2
+version: 1
 owner: data-platform
 schema:
   - {name: id, type: long, nullable: false}
-  - {name: signed_amount, type: "decimal(18,2)", nullable: false}
+  - {name: signed_amount, type: double, nullable: false}
 expectations:
   - {type: unique, column: id}
   - {type: accepted_values, column: base_type, values: [CREDIT, DEBIT]}
-  - {type: conditional_sign, column: signed_amount, when: {base_type: DEBIT}, sign: negative}
+  - {type: conditional_sign, column: signed_amount, when_column: base_type,
+     when_value: DEBIT, sign: negative}
   - {type: freshness, column: txn_date, max_lag_days: 3}
   - {type: row_count, min: 1000}
 ```
 
+(`conditional_sign` takes flat `when_column` / `when_value` keys, not a nested
+`when:` mapping — an earlier draft of this ADR showed the latter, which the
+validator would have met with a `KeyError`. Amounts are declared `double`, not
+`decimal(18,2)`, matching the code; see
+[ADR-0003](ADR-0003-medallion-layer-boundaries.md) for why `double` is the
+weaker choice for money and what production would do instead.)
+
 Two rules make it load-bearing:
 
-**Silver and Gold fail closed.** A violation raises `ContractViolation` *before*
-any write, so the target table is left absent rather than half-correct. Verified
-against real data: an injected sign inversion aborts the build over 19,290 rows
-and `silver.transactions` does not exist afterward.
+**Silver and Gold both fail closed.** A violation raises `ContractViolation`
+*before* any write, so the target table is left absent or unchanged rather than
+half-correct — `silver.build_all` validates the conformed transactions and
+`gold.build_all` validates the training set, each immediately before their
+write. Verified against real data: an injected sign inversion aborts the Silver
+build over 19,290 rows and `silver.transactions` does not exist afterward; a
+nulled `ticker` aborts the Gold build and `gold.forecast_training_set` keeps its
+previous contents.
+
+**Declarations are checks, or they are decoration.** `nullable: false` in the
+schema block is enforced as an implicit not-null, and a `range` expectation over
+a column with no non-null values *fails* rather than passing. Both used to be
+the other way round, and together they had a hole big enough to drive a table
+through: `signed_amount` is the one `nullable: false` column with no separate
+`not_null` expectation, so a Silver table whose `signed_amount` was 100% NULL
+passed the entire contract and `assert_valid` did not raise.
 
 **Freshness is evaluated against a logical as-of date, never wall-clock time.**
 The dataset ends 2026-06-30, so a wall-clock freshness check would fail
@@ -89,8 +110,10 @@ passing.
   contract now matches `schemas.BRONZE_TRANSACTIONS` exactly: no missing columns
   (no noise) and no extra columns (no false "dropped" breaking findings).
   Completeness is a maintenance obligation this design creates.
-- A `range` expectation on an all-null column passes silently rather than
-  reporting "no values", unlike `freshness`. Known, deferred.
-- Reimplementing validation means reimplementing its bugs. Three were found
-  during development and fixed; a mature library would have had them fixed
-  already.
+- Reimplementing validation means reimplementing its bugs. Five were found and
+  fixed — three during development, and two in the final whole-branch review
+  (`nullable: false` parsed but never read, and `range` passing on an all-null
+  column). A mature library would have had all five fixed already, and the two
+  late ones were load-bearing: between them they let a fully-NULL amount column
+  through a contract that declares it non-nullable. That is the honest cost of
+  this decision, not a footnote to it.

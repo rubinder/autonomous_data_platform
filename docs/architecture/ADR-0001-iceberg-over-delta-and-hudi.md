@@ -36,7 +36,7 @@ The properties actually exercised in this repository are:
 
 | Property | Where it is used | Proven by |
 |---|---|---|
-| Hidden partitioning | `day(_ingested_at)` on Bronze, `month(txn_date)` on Silver | partition specs resolve for 12/12 tables |
+| Hidden partitioning | `day(_ingested_at)` on Bronze, `month(txn_date)` on Silver | partition specs resolve for 14/14 tables in `schemas.ALL_TABLES` |
 | Snapshot isolation | every layer write | re-run creates a new snapshot with no duplicate rows |
 | Time travel | `make timetravel` | reads at snapshot N−1 vs N |
 | Schema evolution | `make drift-demo` (5 schema versions) | old snapshots still readable, no rewrite |

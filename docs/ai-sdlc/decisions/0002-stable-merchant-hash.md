@@ -41,12 +41,15 @@ The reviewer reproduced the bug before accepting the fix: running the plan's
 version in two processes produced **3 differing merchant-id values**; the shipped
 version produced identical output.
 
-**Honest limit: that check was performed by hand, not pinned by a test.**
-`tests/test_yodlee_feed.py::test_deterministic` still generates twice in one
-process, so it remains the same not-quite-determinism test described above — it
-would not catch a regression to `hash()`. What protects the property today is
-that `hashlib` is used at the one site that matters and the reasoning is in the
-code. A subprocess-based test is the right follow-up and has not been written.
+**That check was originally performed by hand and not pinned by a test. It is
+pinned now.** `tests/test_yodlee_feed.py::test_deterministic_across_separate_processes`
+runs generation in two separate interpreters with `PYTHONHASHSEED=random` and
+asserts a byte-identical sha256 of the output. Re-demonstrated during the final
+review: reverting `_stable_merchant_hash` to builtin `hash()` makes the
+subprocess test fail with two differing digests while
+`test_deterministic` — which still generates twice in one process — stays
+green. That is the whole point recorded above, now enforced rather than
+narrated.
 
 ## Where else this bit
 

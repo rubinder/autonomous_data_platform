@@ -88,10 +88,11 @@ def build_report(preds: pd.DataFrame, training: pd.DataFrame | None = None) -> s
         if losers:
             # Deliberately no lag/beta narrative here: measured against this
             # run's results, ticker ranking by IC does not track planted lag
-            # or beta (e.g. CMG has the shortest lag and highest beta but is
-            # not the best performer) -- inventing a causal story the data
-            # doesn't support is exactly the overclaiming this report exists
-            # to avoid. State only what was measured.
+            # or beta (e.g. CMG has the highest beta and the shortest lag --
+            # tied with DPZ at 2 trading days -- but is not the best
+            # performer) -- inventing a causal story the data doesn't support
+            # is exactly the overclaiming this report exists to avoid. State
+            # only what was measured.
             loser_ics = [backtest.metrics(preds[preds["ticker"] == t],
                                            "y_pred_model")["ic"] for t in losers]
             lines.append(

@@ -36,6 +36,50 @@ def test_weekend_is_not_reported_missing_for_a_trading_calendar():
     assert arrival.missing_periods(set(expected), expected) == []
 
 
+def test_memorial_day_is_not_reported_missing():
+    """Cited as verified in both README and ADR-0007; nothing pinned it."""
+    expected = config.trading_days(date(2026, 5, 18), date(2026, 5, 29))
+    assert date(2026, 5, 25) not in expected
+    assert arrival.missing_periods(set(expected), expected) == []
+
+
+def test_holiday_past_end_date_is_not_reported_as_a_gap(engine):
+    """The bug: the holiday calendar ended before the as-of window did.
+
+    At the documented AS_OF_DATE=2026-07-31 the gap window runs to 2026-07-31,
+    past END_DATE (2026-06-30). With the calendar stopping at END_DATE,
+    2026-07-03 -- NYSE-observed Independence Day, because 4 July 2026 is a
+    Saturday -- was listed as a missing trading day, three lines above the
+    docs' claim that holidays are correctly not gaps.
+    """
+    sla = next(s for s in arrival.ARRIVAL_SLAS if s.table == "silver.stock_prices")
+    results = arrival.check_arrival(engine, sla, as_of=date(2026, 7, 31))
+    gap = next(r for r in results if r.kind == "arrival_gap")
+
+    window = arrival.expected_periods("trading", date(2026, 7, 1), date(2026, 7, 31))
+    assert date(2026, 7, 3) not in window          # holiday
+    assert date(2026, 7, 4) not in window          # Saturday
+    assert date(2026, 7, 2) in window and date(2026, 7, 6) in window
+    assert "2026-07-03" not in gap.detail
+
+
+def test_partial_check_is_absent_where_it_could_never_fire():
+    """`min_rows_per_period=1` against a count(*) GROUP BY is unsatisfiable.
+
+    A check that cannot fire must not be displayed as a passing check. Where
+    there is no structural floor the SLA declares None and emits nothing.
+    """
+    for sla in arrival.ARRIVAL_SLAS:
+        assert sla.min_rows_per_period is None or sla.min_rows_per_period > 1
+
+
+def test_no_partial_result_for_an_sla_without_a_floor(engine):
+    sla = next(s for s in arrival.ARRIVAL_SLAS if s.table == "silver.transactions")
+    assert sla.min_rows_per_period is None
+    results = arrival.check_arrival(engine, sla, as_of=date(2026, 6, 30))
+    assert not any(r.kind == "arrival_partial" for r in results)
+
+
 def test_arrival_check_passes_on_a_complete_feed(engine):
     sla = next(s for s in arrival.ARRIVAL_SLAS if s.table == "silver.stock_prices")
     results = arrival.check_arrival(engine, sla, as_of=date(2026, 6, 30))

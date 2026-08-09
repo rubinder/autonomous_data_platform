@@ -1,5 +1,6 @@
 from itertools import pairwise
 
+import pyarrow as pa
 import pytest
 
 from src import config
@@ -64,3 +65,46 @@ def test_realized_vol_non_negative(engine):
     out = engine.sql("SELECT min(realized_vol_21d) AS lo FROM f WHERE realized_vol_21d IS NOT NULL",
                      tables={"f": schemas.GOLD_STOCK_FEATURES.name}).to_pylist()[0]
     assert out["lo"] >= 0
+
+
+def test_gold_training_set_satisfies_its_own_contract(engine):
+    """`contracts/gold_forecast_training_set.yaml` had no production caller.
+
+    `assert_valid`'s only call site was Silver, so Gold's four expectations
+    were evaluated by nothing while ADR-0005 claimed "Silver and Gold fail
+    closed". They are evaluated now, and they pass on real data.
+    """
+    from src.contracts import validator
+
+    contract = validator.load_contract(
+        validator.CONTRACTS_DIR / "gold_forecast_training_set.yaml")
+    training = engine.scan_arrow(schemas.GOLD_TRAINING.name)
+    report = validator.validate(training, contract, as_of=config.END_DATE)
+    assert report.passed, [f"{f.kind}/{f.column}: {f.detail}" for f in report.failures]
+
+
+def test_contract_violation_aborts_the_gold_build(engine, monkeypatch):
+    """Fail closed means the table is left as it was, not written half-wrong."""
+    from src.contracts import validator
+
+    before = engine.scan_arrow(schemas.GOLD_TRAINING.name).num_rows
+
+    real = gold.build_training_set
+
+    def poisoned(eng):
+        table = real(eng)
+        idx = table.schema.get_field_index("ticker")
+        return table.set_column(
+            idx, "ticker",
+            pa.array([None] * table.num_rows, table.schema.field(idx).type))
+
+    monkeypatch.setattr(gold, "build_training_set", poisoned)
+
+    with pytest.raises(validator.ContractViolation) as exc:
+        gold.build_all(engine)
+    assert "ticker" in str(exc.value)
+
+    monkeypatch.undo()
+    # The poisoned frame never reached the table.
+    assert engine.scan_arrow(schemas.GOLD_TRAINING.name).num_rows == before
+    gold.build_all(engine)

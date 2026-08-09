@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+import sys
 
 from src import config
 from src.generators import yodlee_feed
@@ -44,9 +47,43 @@ def test_ids_unique_and_json_serializable():
 
 
 def test_deterministic():
+    """Same-process purity. NOT a determinism test -- see the one below."""
     a = yodlee_feed.generate_transactions(seed=11, n=1000)
     b = yodlee_feed.generate_transactions(seed=11, n=1000)
     assert a == b
+
+
+_GENERATE_AND_DIGEST = """
+import hashlib, json, sys
+from src.generators import yodlee_feed
+records = yodlee_feed.generate_transactions(seed=11, n=1500)
+blob = json.dumps(records, sort_keys=True, default=str).encode()
+sys.stdout.write(hashlib.sha256(blob).hexdigest())
+"""
+
+
+def test_deterministic_across_separate_processes():
+    """The determinism test the same-process one structurally cannot be.
+
+    `docs/ai-sdlc/decisions/0002` records a real bug -- builtin `hash()` for
+    merchant ids -- that `test_deterministic` above passed straight through,
+    because both of its observations shared the process state that varied.
+    Two interpreters with `PYTHONHASHSEED=random` do not share it. Reverting
+    `_stable_merchant_hash` to builtin `hash()` makes this fail and leaves
+    `test_deterministic` green.
+    """
+    env = {**os.environ, "PYTHONHASHSEED": "random",
+           "PYTHONPATH": str(config.REPO_ROOT)}
+    digests = set()
+    for _ in range(2):
+        proc = subprocess.run(  # fixed argv, no shell
+            [sys.executable, "-c", _GENERATE_AND_DIGEST],
+            cwd=config.REPO_ROOT, env=env, capture_output=True,
+            text=True, check=True)
+        digests.add(proc.stdout.strip())
+    assert len(digests) == 1, (
+        f"generation differs across processes: {digests}")
+    assert next(iter(digests))
 
 
 def test_some_transactions_are_late_arriving_corrections():

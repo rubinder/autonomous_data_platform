@@ -103,8 +103,14 @@ def generate_transactions(seed: int = config.SEED, n: int | None = None) -> list
 
 
 def _stable_merchant_hash(merchant: str) -> int:
-    """Deterministic across processes, unlike Python's randomized str hash()."""
-    digest = hashlib.md5(merchant.encode("utf-8")).hexdigest()
+    """Deterministic across processes, unlike Python's randomized str hash().
+
+    `usedforsecurity=False` states the intent that a scanner would otherwise
+    have to guess: md5 is used here purely to synthesise a stable surrogate id
+    from a merchant string, never to authenticate or protect anything.
+    """
+    digest = hashlib.md5(merchant.encode("utf-8"),
+                         usedforsecurity=False).hexdigest()
     return int(digest, 16) % 10_000_000
 
 

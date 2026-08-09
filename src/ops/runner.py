@@ -17,7 +17,7 @@ from src import config
 from src.contracts import validator
 from src.lakehouse import bronze, schemas
 from src.lakehouse.engines import get_engine
-from src.ops import monitors
+from src.ops import alerts, monitors
 
 TYPED_TABLES = (
     (schemas.SILVER_TRANSACTIONS, "silver_transactions.yaml"),
@@ -74,18 +74,19 @@ def run_monitors(engine, as_of: date, monitor_dir=None) -> list[monitors.Monitor
                 query_tables = {"t": definition.table, **(definition.tables or {})}
                 out = engine.sql(definition.query, tables=query_tables)
                 metric = float(out.column("metric")[0].as_py() or 0.0)
-        except Exception as exc:  # noqa: BLE001 -- a malformed monitor query
-            # must not crash the whole run; report it as a breach instead so
-            # a broken check is visible rather than silently skipped.
+            baseline = load_baselines(engine, definition.name, definition.column)
+            params = {**(definition.params or {}), "kind": definition.kind}
+            status, detail = monitors.evaluate(metric, baseline, params)
+        except Exception as exc:  # noqa: BLE001 -- a malformed monitor query, or
+            # an unrecognised `kind` in its YAML, must not crash the whole run;
+            # report it as a breach instead so a broken check is visible rather
+            # than silently skipped -- or, worse, silently passing.
             results.append(monitors.MonitorResult(
                 definition.name, definition.table, definition.column,
                 definition.kind, None, None, "breach",
-                f"monitor query failed: {type(exc).__name__}: {exc}", as_of))
+                f"monitor failed: {type(exc).__name__}: {exc}", as_of))
             continue
 
-        baseline = load_baselines(engine, definition.name, definition.column)
-        params = {**(definition.params or {}), "kind": definition.kind}
-        status, detail = monitors.evaluate(metric, baseline, params)
         results.append(monitors.MonitorResult(
             definition.name, definition.table, definition.column,
             definition.kind, metric,
@@ -97,7 +98,7 @@ def run_monitors(engine, as_of: date, monitor_dir=None) -> list[monitors.Monitor
             continue
         contract = validator.load_contract(
             validator.CONTRACTS_DIR / contract_file)
-        results += monitors.check_column_types(engine, table_def, contract)
+        results += monitors.check_column_types(engine, table_def, contract, as_of)
 
     return results
 
@@ -114,7 +115,23 @@ def persist(engine, results: list[monitors.MonitorResult]) -> int:
     return len(payload)
 
 
+def route_alerts(engine, results: list[monitors.MonitorResult],
+                 dry_run: bool = True) -> list[str]:
+    """Turn this run's warn/breach results into throttled alerts.
+
+    This is the production caller of `src.ops.alerts`. Without it the alert
+    module had no production caller at all: `ops.alert_log` was declared in
+    `schemas.ALL_TABLES` and created by nothing, while the docs described
+    throttled alerting as live behaviour. Dry-run by default, exactly like the
+    agent's `act` node -- the delivery side effect is opt-in, the log is not.
+    """
+    engine.create_table(schemas.OPS_ALERT_LOG)
+    return alerts.route(engine, alerts.from_monitor_results(results),
+                        dry_run=dry_run)
+
+
 def main() -> int:
+    execute = "--execute" in sys.argv
     engine = get_engine()
     as_of = config.resolve_as_of_date(bronze.max_txn_date(engine))
     results = run_monitors(engine, as_of)
@@ -126,6 +143,16 @@ def main() -> int:
           f"{len(breaches)} breach, {len(warns)} warn")
     for result in breaches + warns:
         print(f"  [{result.status}] {result.monitor}: {result.detail}")
+
+    routed = route_alerts(engine, results, dry_run=not execute)
+    if routed:
+        for line in routed:
+            print(f"  -> {line}")
+        if not execute:
+            print("monitors: alert routing is dry-run "
+                  "(pass --execute to mark alerts delivered)")
+    else:
+        print("monitors: no alertable results, nothing routed")
     return 1 if breaches else 0
 
 

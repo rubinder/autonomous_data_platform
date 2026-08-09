@@ -46,8 +46,11 @@ def fit_predict_ticker(df: pd.DataFrame, n_folds: int = 5) -> pd.DataFrame:
 
     frames = []
     for fold in folds:
-        # Regularised hard, deliberately: at ~380 training rows, 14 features,
-        # and a measured max |feature-target correlation| of 0.156 (Task 10),
+        # Regularised hard, deliberately: at 120-516 training rows per fold
+        # (measured across the six tickers at full scale; mean 318, and the
+        # first fold is the smallest by construction under an expanding
+        # window), 14 features, and a measured max |feature-target
+        # correlation| of 0.156 (Task 10),
         # the earlier config (max_iter=200, learning_rate=0.05,
         # l2_regularization=1.0, min_samples_leaf=20) overfit -- predictions
         # came out at roughly half the target's amplitude with near-zero

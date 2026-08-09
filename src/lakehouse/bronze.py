@@ -15,7 +15,7 @@ from datetime import UTC, date, datetime
 
 import pyarrow as pa
 
-from src import config
+from src import config, dates
 from src.generators import stock_prices, yodlee_feed
 from src.lakehouse import schemas
 from src.lakehouse.engines import get_engine
@@ -84,21 +84,33 @@ def ingest_all(engine, n_transactions: int | None = None) -> dict[str, int]:
 
 
 def max_txn_date(engine) -> date | None:
-    """Latest `transactionDate` seen in Bronze, or None if the table is empty/absent.
+    """Newest *parseable* `transactionDate` in Bronze; None if none parses.
 
-    `transactionDate` is a raw source string (Bronze does no type coercion), so
-    the max is computed as a string and parsed only for the return value.
+    Deliberately not `SELECT max(transactionDate)`. `transactionDate` is a raw
+    source string and Bronze does no type coercion, so a malformed value is
+    expected input, not an edge case -- and a malformed value that sorts
+    lexicographically above every real date (`"zzz-not-a-date"`) *becomes* the
+    SQL max, whereupon parsing it raises. This function is called before the
+    agent graph even starts (`graph.run`) and by `silver`, `runner`, and
+    `arrival` to resolve AS_OF_DATE, so raising here takes down `make agent`,
+    `make monitor`, `make arrival`, and `make silver` at once -- the same
+    failure `src.agent.sensors` was hardened against, on a code path the
+    sensor hardening runs too late to protect.
+
+    `DISTINCT` keeps the parse loop to the number of distinct day strings
+    (~900) rather than the row count, and `src.dates.max_parseable_date` is
+    the single shared implementation the sensor uses too.
     """
     if not engine.table_exists(schemas.BRONZE_TRANSACTIONS.name):
         return None
     result = engine.sql(
-        "SELECT max(transactionDate) AS d FROM bronze_txn",
+        "SELECT DISTINCT transactionDate AS d FROM bronze_txn",
         tables={"bronze_txn": schemas.BRONZE_TRANSACTIONS.name},
     )
     if result.num_rows == 0:
         return None
-    value = result.column("d")[0].as_py()
-    return date.fromisoformat(value) if value else None
+    newest, _ = dates.max_parseable_date(result.column("d").to_pylist())
+    return newest
 
 
 def main() -> int:

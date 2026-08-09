@@ -54,11 +54,15 @@ class PyIcebergEngine:
     def snapshot_row_counts(self, ident: str) -> list[int]:
         """Rows added per snapshot, from metadata summaries. No data scan.
 
-        Counts `added-records` for *every* operation, including `overwrite` and
-        `replace`. A full Silver/Gold rebuild therefore reports its whole row
-        count as "added", which is not comparable with an incremental append.
-        Volume monitors that need that distinction should use
-        `snapshot_details` and filter on `operation`.
+        Counts `added-records` for *every* operation. A full Silver/Gold
+        rebuild therefore reports its whole row count as "added", which is not
+        comparable with an incremental append. Volume monitors that need that
+        distinction must use `snapshot_details` and filter on
+        **`is_full_rebuild`**, not on `operation`: PyIceberg 0.11.1 commits an
+        `overwrite()` as a `delete` + plain `append` pair and tags *neither*
+        half `operation="overwrite"`, so filtering on `operation` catches
+        nothing at all (see `snapshot_details` below, and
+        `monitors.latest_incremental_added_rows`).
         """
         return [d["added_records"] for d in self.snapshot_details(ident)]
 

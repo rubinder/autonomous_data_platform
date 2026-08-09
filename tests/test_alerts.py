@@ -53,6 +53,39 @@ def test_alert_log_persists(engine):
     assert engine.scan_arrow(schemas.OPS_ALERT_LOG.name).num_rows >= 1
 
 
+def test_monitor_run_routes_alerts_and_writes_the_alert_log(engine):
+    """`src.ops.alerts` had no production caller at all.
+
+    `ops.alert_log` was declared in `schemas.ALL_TABLES`, created by no
+    pipeline, and described in the README and ADR-0007 as live behaviour.
+    `runner.route_alerts` is the wiring that makes those descriptions true.
+    """
+    from src.ops import runner
+
+    results = [_result("ok"), _result("breach", "m_breach"),
+               _result("warn", "m_warn")]
+    routed = runner.route_alerts(engine, results, dry_run=True)
+
+    assert len(routed) == 2                       # ok is not alertable
+    assert all("DRY-RUN" in line for line in routed)
+    assert engine.table_exists(schemas.OPS_ALERT_LOG.name)
+
+    log = engine.scan_arrow(schemas.OPS_ALERT_LOG.name)
+    assert log.num_rows == 2
+    assert set(log.column("delivered").to_pylist()) == {False}
+
+    # Second identical run throttles rather than re-paging.
+    again = runner.route_alerts(engine, results, dry_run=True)
+    assert again and all("throttled" in line.lower() for line in again)
+
+
+def test_a_clean_monitor_run_routes_nothing(engine):
+    from src.ops import runner
+
+    assert runner.route_alerts(engine, [_result("ok")], dry_run=True) == []
+    assert engine.scan_arrow(schemas.OPS_ALERT_LOG.name).num_rows == 0
+
+
 def test_distinct_monitors_are_not_throttled_against_each_other(engine):
     alerts.route(engine, alerts.from_monitor_results([_result(monitor="a")]),
                  dry_run=True)
