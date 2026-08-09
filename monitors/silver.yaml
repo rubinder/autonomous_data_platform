@@ -49,9 +49,20 @@
   params: {breach_ratio: 0.5, warn_ratio: 0.8}
   query: SELECT count(DISTINCT account_id) AS metric FROM t
 
+# The genuine quarantine rate needs both the clean and the quarantined
+# table in one query -- `tables` binds `silver.transactions_quarantine` as
+# a second alias `q` alongside the implicit `t` (-> `table`, above). Before
+# this, the query was a placeholder (`SELECT 0.0 ... LIMIT 1`) that could
+# never fire; it read as passing coverage of the quarantine path on every
+# run while checking nothing. `test_quarantine_rate_monitor_fires_on_
+# injected_non_usd_rows` in tests/test_monitors.py proves it can now breach.
 - name: silver_txn_quarantine_rate
   table: silver.transactions
   kind: null_rate
   severity: breaking
   params: {max_absolute: 0.01}
-  query: SELECT 0.0 AS metric FROM t LIMIT 1
+  tables: {q: silver.transactions_quarantine}
+  query: >
+    SELECT (SELECT count(*) FROM q) * 1.0
+           / nullif((SELECT count(*) FROM t) + (SELECT count(*) FROM q), 0)
+           AS metric

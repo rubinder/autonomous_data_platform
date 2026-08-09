@@ -64,11 +64,16 @@ def run_monitors(engine, as_of: date, monitor_dir=None) -> list[monitors.Monitor
     results: list[monitors.MonitorResult] = []
 
     for definition in monitors.load_monitors(monitor_dir):
-        if not engine.table_exists(definition.table):
+        required_tables = (definition.table, *(definition.tables or {}).values())
+        if not all(engine.table_exists(t) for t in required_tables):
             continue
         try:
-            out = engine.sql(definition.query, tables={"t": definition.table})
-            metric = float(out.column("metric")[0].as_py() or 0.0)
+            if definition.source == "snapshot_added":
+                metric = monitors.latest_incremental_added_rows(engine, definition.table)
+            else:
+                query_tables = {"t": definition.table, **(definition.tables or {})}
+                out = engine.sql(definition.query, tables=query_tables)
+                metric = float(out.column("metric")[0].as_py() or 0.0)
         except Exception as exc:  # noqa: BLE001 -- a malformed monitor query
             # must not crash the whole run; report it as a breach instead so
             # a broken check is visible rather than silently skipped.

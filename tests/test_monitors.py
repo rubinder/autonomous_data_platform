@@ -1,11 +1,44 @@
 from datetime import date
 
+import pyarrow as pa
 import pytest
 
 from src.lakehouse import bronze, gold, schemas, silver
 from src.lakehouse import catalog as catalog_mod
 from src.lakehouse.engines.pyiceberg_engine import PyIcebergEngine
 from src.ops import monitors, runner
+
+
+def _txn_record(txn_id: int, last_updated: str, amount: float,
+                 base_type: str = "DEBIT", currency: str = "USD") -> dict:
+    """A minimal but schema-complete Bronze transaction record. Mirrors
+    tests/test_silver.py's helper of the same name -- kept local rather than
+    imported so this module does not depend on test collection order."""
+    return {
+        "id": txn_id, "accountId": 100_000, "date": "2024-06-01",
+        "transactionDate": "2024-06-01", "postDate": "2024-06-02",
+        "amount": {"amount": amount, "currency": currency},
+        "runningBalance": {"amount": 1000.0, "currency": currency},
+        "merchant": {
+            "id": "M1", "source": "TEST MERCHANT", "categoryLabel": "Test",
+            "address": {"city": "SEATTLE", "state": "WA", "country": "USA"},
+        },
+        "status": "POSTED", "baseType": base_type,
+        "subType": "PAYMENT" if base_type == "DEBIT" else "CREDIT",
+        "category": "Other Expenses",
+        "categoryType": "EXPENSE" if base_type == "DEBIT" else "INCOME",
+        "categoryId": 40, "detailCategoryId": 4000,
+        "detailCategory": "Uncategorized", "highLevelCategoryId": 30,
+        "categorySource": "SYSTEM", "sourceType": "AGGREGATED",
+        "checkNumber": "", "isManual": False, "container": None,
+        "createdDate": last_updated, "lastUpdated": last_updated,
+    }
+
+
+def _append_synthetic_txns(engine, records: list[dict]) -> None:
+    enriched = bronze.add_lineage(records, "synthetic_test.json")
+    table = pa.Table.from_pylist(enriched, schema=schemas.BRONZE_TRANSACTIONS.schema.as_arrow())
+    engine.append(schemas.BRONZE_TRANSACTIONS.name, table)
 
 
 @pytest.fixture(scope="module")
@@ -118,3 +151,42 @@ def test_duplicate_rate_monitor_is_zero_on_deduped_silver(engine):
     results = runner.run_monitors(engine, as_of=date(2026, 6, 30))
     dupes = [r for r in results if r.monitor == "silver_txn_duplicate_ids"]
     assert dupes and dupes[0].metric == 0
+
+
+def test_bronze_volume_monitor_catches_a_collapsed_batch(tmp_path_factory):
+    """Cumulative count(*) barely moves when a near-total outage hits an
+    append-only feed -- five 1,000-row batches then a single row still reads
+    as ~5,001 vs a baseline of ~3,000, comfortably above breach_ratio. The
+    monitor instead measures rows added per snapshot (source: snapshot_added),
+    which sees the collapse directly."""
+    eng = PyIcebergEngine(catalog_mod.get_catalog(tmp_path_factory.mktemp("wh")))
+    results = []
+    for n in (1000, 1000, 1000, 1000, 1000, 1):
+        bronze.ingest_all(eng, n_transactions=n)
+        results = runner.run_monitors(eng, as_of=date(2026, 6, 30))
+        runner.persist(eng, results)
+
+    volume = next(r for r in results if r.monitor == "bronze_txn_row_count")
+    assert volume.metric == 1
+    assert volume.status == "breach"
+
+
+def test_quarantine_rate_monitor_fires_on_injected_non_usd_rows(tmp_path_factory):
+    """The old query (`SELECT 0.0 ... LIMIT 1`) could never fire. The real
+    one joins the quarantine table against the clean one and must breach
+    when a batch of non-USD rows lands."""
+    eng = PyIcebergEngine(catalog_mod.get_catalog(tmp_path_factory.mktemp("wh")))
+    bronze.ingest_all(eng, n_transactions=200)
+    silver.build_all(eng)
+
+    eur_rows = [
+        _txn_record(900_000 + i, "2024-06-01T00:00:00+00:00", 50.0, currency="EUR")
+        for i in range(10)
+    ]
+    _append_synthetic_txns(eng, eur_rows)
+    silver.build_all(eng)
+
+    results = runner.run_monitors(eng, as_of=date(2026, 6, 30))
+    quarantine = next(r for r in results if r.monitor == "silver_txn_quarantine_rate")
+    assert quarantine.metric > 0
+    assert quarantine.status == "breach"

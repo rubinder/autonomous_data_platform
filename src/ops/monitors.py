@@ -29,6 +29,16 @@ class MonitorDef:
     column: str | None = None
     severity: str = "additive"
     params: dict | None = None
+    # Extra table aliases beyond the implicit "t" -> `table`, for monitors
+    # that compare two tables (e.g. a quarantine rate needs both the clean
+    # and the quarantined table in one query).
+    tables: dict[str, str] | None = None
+    # "sql" (default): `query` is run through `engine.sql()` and must return
+    # a `metric` column. "snapshot_added": the metric comes from
+    # `engine.snapshot_details()` instead -- rows added by the most recent
+    # non-rebuild snapshot -- for tables where cumulative `count(*)` cannot
+    # see a collapsed batch (see monitors/bronze.yaml).
+    source: str = "sql"
 
 
 @dataclass(frozen=True)
@@ -53,7 +63,9 @@ def load_monitors(path: Path | None = None) -> list[MonitorDef]:
                 name=raw["name"], table=raw["table"], kind=raw["kind"],
                 query=raw["query"], column=raw.get("column"),
                 severity=raw.get("severity", "additive"),
-                params=raw.get("params") or {}))
+                params=raw.get("params") or {},
+                tables=raw.get("tables") or None,
+                source=raw.get("source", "sql")))
     return defs
 
 
@@ -124,6 +136,30 @@ def evaluate(metric: float, baseline: list[float],
             "breach", f"{metric:g} duplicate key(s)")
 
     return "ok", f"{metric:g}"
+
+
+def latest_incremental_added_rows(engine, ident: str) -> float:
+    """Rows added by the most recent non-rebuild snapshot.
+
+    Cumulative `count(*)` is the right volume signal for Silver/Gold, which
+    are fully overwritten every run, but it is the wrong one for an
+    append-only table like Bronze: five batches of 1,000 rows followed by an
+    upstream outage that delivers 1 row still reports `5001 vs baseline
+    3000` on a `count(*)` monitor -- cumulative size barely moves, and the
+    near-total collapse is invisible. What must be measured instead is the
+    size of the batch that just landed, which is exactly what
+    `engine.snapshot_details()`'s `added_records` gives per snapshot.
+
+    Filtered to `is_full_rebuild=False` on principle (not on `operation`,
+    which PyIceberg 0.11.1 never sets to "overwrite" for either half of a
+    rebuild -- see `PyIcebergEngine.snapshot_details`): Bronze never rebuilds
+    in this pipeline, but a monitor reused on a table that someday does
+    should not silently count a rebuild's whole history as "added".
+    """
+    incremental = [d for d in engine.snapshot_details(ident) if not d["is_full_rebuild"]]
+    if not incremental:
+        return 0.0
+    return float(incremental[-1]["added_records"])
 
 
 # Iceberg declared type -> the Arrow types that legitimately represent it.

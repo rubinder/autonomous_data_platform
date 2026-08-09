@@ -1,14 +1,25 @@
-# Bronze row counts are read as `count(*)` over the live table, not as
-# per-snapshot added-records: Bronze is append-only, so the two agree here.
-# (Silver/Gold are full rebuilds every run -- see monitors/silver.yaml and
-# monitors/gold.yaml for why those tables use the same full-scan approach
-# rather than snapshot deltas, which would misread every rebuild as a spike.)
+# Bronze is append-only, which is exactly the case where cumulative
+# `count(*)` is the WRONG volume signal (the opposite of Silver/Gold -- see
+# monitors/silver.yaml and monitors/gold.yaml, which are full rebuilds every
+# run and use `count(*)` deliberately). Cumulative size barely moves when an
+# upstream feed collapses: five batches of 1,000 rows followed by a batch of
+# 1 row still reports "5001 vs baseline 3000" on a `count(*)` monitor -- a
+# near-total outage stays invisible. `source: snapshot_added` instead reads
+# `engine.snapshot_details()`'s `added_records` for the latest non-rebuild
+# snapshot, i.e. the size of the batch that just landed. Bronze's snapshots
+# are always `operation="append"` with `is_full_rebuild=False`, so this is
+# an unambiguous per-batch signal. `query` below documents the *shape* the
+# metric would take as a query, for readability, but the source keys off
+# `source: snapshot_added` and `query` is not executed for this monitor.
 - name: bronze_txn_row_count
   table: bronze.yodlee_transactions_raw
   kind: row_count
   severity: breaking
+  source: snapshot_added
   params: {breach_ratio: 0.5, warn_ratio: 0.8}
-  query: SELECT count(*) AS metric FROM t
+  query: >
+    -- not executed: metric = added_records of the latest non-rebuild
+    -- snapshot, from engine.snapshot_details(), not a SQL aggregate.
 
 - name: bronze_txn_null_id_rate
   table: bronze.yodlee_transactions_raw
