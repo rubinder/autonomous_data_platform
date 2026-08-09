@@ -73,11 +73,22 @@ def test_volume_collapse_appends_against_an_evolved_table(engine):
 
 
 def test_expire_snapshots_retains_requested_count(engine):
+    """Exactly the requested count, and exactly the newest ones."""
+    ident = schemas.BRONZE_TRANSACTIONS.name
     for _ in range(4):
         bronze.ingest_all(engine, n_transactions=300)
-    assert len(engine.snapshots(schemas.BRONZE_TRANSACTIONS.name)) > 3
-    maintenance.expire(engine, retain_last=2)
-    assert len(engine.snapshots(schemas.BRONZE_TRANSACTIONS.name)) <= 3
+    before = engine.snapshots(ident)
+    assert len(before) == 5
+
+    removed = maintenance.expire(engine, retain_last=2)
+
+    after = engine.snapshots(ident)
+    assert len(after) == 2
+    assert after == before[-2:]     # the newest two, not any two
+    assert removed >= 3             # bronze's 3, plus any other table's
+
+    with pytest.raises(Exception):  # noqa: B017 -- PyIceberg raises ValueError
+        engine.scan_arrow(ident, snapshot_id=before[0])  # genuinely gone
 
 
 def test_expire_is_a_no_op_when_history_is_short(engine):

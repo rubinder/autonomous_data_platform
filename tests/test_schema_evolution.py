@@ -1,3 +1,4 @@
+import pyarrow as pa
 import pytest
 from pyiceberg.types import IntegerType, LongType, StringType
 
@@ -33,13 +34,49 @@ def test_old_snapshot_still_readable_after_evolution(engine):
 
 
 def test_widening_int_to_long_preserves_existing_values(engine):
+    """Real int32 values must survive the promotion, not just the column.
+
+    Adding the column and never writing to it leaves every row NULL, and a
+    test asserting only on column presence and row count would then pass even
+    if widening blanked the column entirely. So write actual values under the
+    int32 schema first, and assert on those values afterwards.
+    """
     maintenance.evolve_add_column(engine, "settlementDays", IntegerType())
-    bronze.ingest_all(engine, n_transactions=200)
+    written = _write_settlement_days(engine, [7 * i for i in range(50)])
+    bronze.ingest_all(engine, n_transactions=200)  # feed emits no such column
+
+    out_before = engine.scan_arrow(IDENT)
+    assert out_before.schema.field("settlementDays").type == pa.int32()
+
     widened = maintenance.evolve_widen_column(engine, "settlementDays", LongType())
     assert widened
+
     out = engine.scan_arrow(IDENT)
     assert "settlementDays" in out.column_names
-    assert out.num_rows == 1200
+    assert out.num_rows == 1250
+    assert out.schema.field("settlementDays").type == pa.int64()
+    values = out.column("settlementDays").to_pylist()
+    kept = sorted(v for v in values if v is not None)
+    assert len(kept) == 50                       # nothing nulled by the promotion
+    assert kept == written                       # and nothing altered
+    assert kept[0] == 0 and kept[-1] == 343
+
+
+def _write_settlement_days(engine, values: list[int]) -> list[int]:
+    """Append rows carrying real `settlementDays` values under the int32 schema.
+
+    The generated feed never emits this column, so the only way to get
+    non-null values across the type promotion is to write them directly.
+    Built from a slice of the live table so the column set matches exactly --
+    `engine.append` rejects anything else.
+    """
+    batch = engine.scan_arrow(IDENT).slice(0, len(values))
+    assert batch.num_rows == len(values)
+    index = batch.column_names.index("settlementDays")
+    batch = batch.set_column(
+        index, "settlementDays", pa.array(values, pa.int32()))
+    engine.append(IDENT, batch)
+    return sorted(values)
 
 
 def test_rename_resolves_by_field_id_not_name(engine):
@@ -129,6 +166,32 @@ def test_incremental_read_returns_only_the_delta(engine):
     bronze.ingest_all(engine, n_transactions=400)
     second = engine.snapshots(IDENT)[-1]
     assert maintenance.incremental_rows(engine, IDENT, first, second) == 400
+
+
+def test_incremental_read_of_a_snapshot_against_itself_is_zero(engine):
+    """Nothing has happened since a snapshot, as of that same snapshot."""
+    first = engine.snapshots(IDENT)[-1]
+    bronze.ingest_all(engine, n_transactions=400)   # must not leak into the answer
+    assert maintenance.incremental_rows(engine, IDENT, first, first) == 0
+    latest = engine.snapshots(IDENT)[-1]
+    assert maintenance.incremental_rows(engine, IDENT, latest, latest) == 0
+
+
+def test_incremental_read_rejects_a_reversed_range(engine):
+    """A silent 0 here reads as 'no rows arrived', which is a real alarm."""
+    first = engine.snapshots(IDENT)[-1]
+    bronze.ingest_all(engine, n_transactions=400)
+    second = engine.snapshots(IDENT)[-1]
+    with pytest.raises(ValueError, match="reversed"):
+        maintenance.incremental_rows(engine, IDENT, second, first)
+
+
+def test_incremental_read_rejects_an_unknown_snapshot_id(engine):
+    known = engine.snapshots(IDENT)[-1]
+    with pytest.raises(ValueError, match="to_snapshot=-1"):
+        maintenance.incremental_rows(engine, IDENT, known, -1)
+    with pytest.raises(ValueError, match="from_snapshot=-1"):
+        maintenance.incremental_rows(engine, IDENT, -1, known)
 
 
 def test_evolution_is_idempotent(engine):

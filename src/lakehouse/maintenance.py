@@ -144,17 +144,33 @@ def incremental_rows(engine, ident: str, from_snapshot: int,
 
     `from_snapshot` is exclusive and `to_snapshot` inclusive -- the delta a
     consumer that has already read up to `from_snapshot` still owes itself.
+    Identical ids therefore mean zero: nothing has happened since.
+
+    Every other bad input raises instead of returning a number. An unknown id
+    or a reversed range answered with a bare `0` is the worst possible output
+    for a monitoring helper, because `0` is indistinguishable from the real
+    and alarming answer "no rows arrived" -- a caller watching for a stalled
+    feed would read a typo'd snapshot id as an outage, or a stalled feed as
+    fine, with nothing to tell the two apart.
     """
-    seen, total = False, 0
-    for detail in engine.snapshot_details(ident):
-        if detail["snapshot_id"] == from_snapshot:
-            seen = True
-            continue
-        if seen:
-            total += detail["added_records"]
-        if detail["snapshot_id"] == to_snapshot:
-            break
-    return total
+    details = engine.snapshot_details(ident)
+    positions = {d["snapshot_id"]: i for i, d in enumerate(details)}
+
+    for label, snapshot_id in (("from_snapshot", from_snapshot),
+                               ("to_snapshot", to_snapshot)):
+        if snapshot_id not in positions:
+            raise ValueError(
+                f"{label}={snapshot_id} is not a snapshot of {ident}")
+
+    start, end = positions[from_snapshot], positions[to_snapshot]
+    if start == end:
+        return 0
+    if start > end:
+        raise ValueError(
+            f"from_snapshot={from_snapshot} is newer than "
+            f"to_snapshot={to_snapshot} on {ident}; the range is reversed")
+
+    return sum(d["added_records"] for d in details[start + 1:end + 1])
 
 
 def time_travel_demo(engine, ident: str = IDENT) -> dict[str, int]:
