@@ -64,3 +64,26 @@ def test_run_all_handles_multiple_tickers():
 def test_short_series_is_skipped_not_crashed():
     out = models.run_all(_synthetic(n=60))
     assert out.empty
+
+
+def test_arima_fallback_survives_unexpected_exception(monkeypatch):
+    """Pins the "must never abort the run" guarantee for _arima_forecast.
+
+    statsmodels' exception surface is not enumerable -- MissingDataError
+    inherits from Exception, not ValueError, so a narrowed
+    `except (ValueError, LinAlgError)` would let it (and other statsmodels
+    exceptions) propagate and crash the whole run. Injects exactly such an
+    exception -- outside that narrower set -- and asserts the function still
+    falls back to the training mean rather than raising.
+    """
+    from statsmodels.tools.sm_exceptions import MissingDataError
+
+    class _ExplodingARIMA:
+        def __init__(self, *args, **kwargs):
+            raise MissingDataError("injected for test: not a ValueError")
+
+    monkeypatch.setattr("statsmodels.tsa.arima.model.ARIMA", _ExplodingARIMA)
+
+    out = models.fit_predict_ticker(_synthetic())
+    assert len(out) > 0
+    assert np.isfinite(out["y_pred_arima"]).all()

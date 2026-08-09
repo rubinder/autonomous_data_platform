@@ -86,7 +86,14 @@ def _arima_forecast(y: np.ndarray, fold: splits.Fold) -> np.ndarray:
         if not np.isfinite(values).all():
             raise ValueError("non-finite forecast")
         return values
-    except (ValueError, np.linalg.LinAlgError):
+    except Exception:  # noqa: BLE001 -- deliberately broad: ARIMA is a
+        # fallback-capable baseline whose failure must degrade to the
+        # training mean rather than propagate and abort the whole run.
+        # statsmodels' exception surface is not enumerable -- e.g.
+        # MissingDataError inherits from Exception, not ValueError, and a
+        # degenerate/too-short block can raise IndexError or LinAlgError.
+        # A narrower catch would let any one of those crash forecasting for
+        # every other ticker; see test_arima_fallback_survives_unexpected_exception.
         return np.full(len(fold.test), float(np.mean(y[fold.train])))
 
 
