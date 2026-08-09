@@ -57,26 +57,67 @@ ICEBERG_RUNTIME = "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2"
 # called; this is the one spelling Spark cannot parse.
 #
 # Scoped to `AS TIMESTAMP WITH TIME ZONE` (a CAST target) rather than the
-# bare phrase, and applied only outside single-quoted string literals (see
-# `_translate_tstz_cast`) -- a query that legitimately contains this text
-# as *data*, not syntax, must come back unchanged. This is a narrow dialect
-# shim, not a SQL parser: it does not understand double-quoted identifiers,
-# dollar-quoted strings, or comments, none of which appear in this
-# codebase's queries today.
+# bare phrase, and applied only outside string literals, quoted identifiers,
+# and comments (see `_translate_tstz_cast`) -- a query that legitimately
+# contains this text as *data*, not syntax, must come back unchanged. This
+# is a narrow dialect shim, not a SQL parser: it does not understand
+# dollar-quoted strings or nested comments, neither of which appear in this
+# codebase's queries today. It does not try to be silently correct beyond
+# that scope either -- if the phrase survives translation somewhere the
+# shim doesn't recognise as safe (a quoted identifier, say), it raises
+# instead of sending Spark a half-translated query.
 _TSTZ_CAST = re.compile(r"\bAS\s+TIMESTAMP\s+WITH\s+TIME\s+ZONE\b", re.IGNORECASE)
+_TSTZ_BARE = re.compile(r"TIMESTAMP\s+WITH\s+TIME\s+ZONE", re.IGNORECASE)
+
 _STRING_LITERAL = re.compile(r"'(?:[^']|'')*'")
+_QUOTED_IDENTIFIER = re.compile(r'"(?:[^"]|"")*"')
+_LINE_COMMENT = re.compile(r"--[^\n]*")
+_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+
+# Spans the shim must never rewrite inside: string literals, quoted
+# identifiers, and comments are all syntactically "not a bare CAST target"
+# regardless of what text they contain.
+_PROTECTED = re.compile(
+    "|".join(p.pattern for p in
+              (_STRING_LITERAL, _QUOTED_IDENTIFIER, _LINE_COMMENT, _BLOCK_COMMENT)),
+    re.DOTALL)
+
+# Of those, only string literals and comments are "understood" well enough
+# that the phrase surviving inside them is fine, not an error -- a comment
+# is prose, a string literal is data. A quoted identifier is neither: it is
+# still part of the query's structure, so the phrase surviving there means
+# the shim missed a real occurrence, not that it found a safe one.
+_SAFE_TO_IGNORE = re.compile(
+    "|".join(p.pattern for p in (_STRING_LITERAL, _LINE_COMMENT, _BLOCK_COMMENT)),
+    re.DOTALL)
 
 
 def _translate_tstz_cast(query: str) -> str:
     """Rewrite `AS TIMESTAMP WITH TIME ZONE` -> `AS TIMESTAMP`, skipping
-    anything inside a single-quoted string literal."""
+    string literals, quoted identifiers, and comments -- then verify the
+    DuckDB spelling didn't survive anywhere else. If it did, the shim
+    doesn't understand where it's sitting (a quoted identifier is the known
+    case); raising beats silently sending Spark a query that is part
+    translated and part not.
+    """
     pieces, cursor = [], 0
-    for literal in _STRING_LITERAL.finditer(query):
-        pieces.append(_TSTZ_CAST.sub("AS TIMESTAMP", query[cursor:literal.start()]))
-        pieces.append(literal.group(0))  # untouched: this is data, not syntax
-        cursor = literal.end()
+    for span in _PROTECTED.finditer(query):
+        pieces.append(_TSTZ_CAST.sub("AS TIMESTAMP", query[cursor:span.start()]))
+        pieces.append(span.group(0))  # untouched: string, identifier, or comment
+        cursor = span.end()
     pieces.append(_TSTZ_CAST.sub("AS TIMESTAMP", query[cursor:]))
-    return "".join(pieces)
+    translated = "".join(pieces)
+
+    residual = _SAFE_TO_IGNORE.sub("", translated)
+    if _TSTZ_BARE.search(residual):
+        raise ValueError(
+            "cannot translate query for Spark: 'TIMESTAMP WITH TIME ZONE' "
+            "appears somewhere this dialect shim does not recognise as a "
+            "CAST target, a string literal, or a comment (a quoted "
+            "identifier, for example) -- refusing to send Spark a "
+            "possibly half-translated query"
+        )
+    return translated
 
 
 class SparkEngine:

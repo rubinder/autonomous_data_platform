@@ -169,3 +169,37 @@ def test_spark_engine_sql_does_not_rewrite_the_phrase_inside_a_string_literal(sp
     out = spark_engine.sql(
         "SELECT 'CAST(x AS TIMESTAMP WITH TIME ZONE)' AS note", tables={})
     assert out.column("note")[0].as_py() == "CAST(x AS TIMESTAMP WITH TIME ZONE)"
+
+
+@pytest.mark.spark
+def test_tstz_cast_translation_leaves_comments_alone():
+    """The phrase inside a `--` line comment or a `/* */` block comment is
+    prose, not syntax -- it must survive untouched and must not trigger the
+    shim's "I don't understand where this is" safety raise. A real CAST
+    target elsewhere in the same query still gets translated.
+    """
+    from src.lakehouse.engines.spark_engine import _translate_tstz_cast
+
+    query = (
+        "-- stores lastUpdated AS TIMESTAMP WITH TIME ZONE upstream\n"
+        "SELECT CAST(y /* AS TIMESTAMP WITH TIME ZONE, historically */ "
+        "AS TIMESTAMP WITH TIME ZONE) AS ts"
+    )
+    translated = _translate_tstz_cast(query)
+    assert "-- stores lastUpdated AS TIMESTAMP WITH TIME ZONE upstream" in translated
+    assert "/* AS TIMESTAMP WITH TIME ZONE, historically */" in translated
+    assert "AS TIMESTAMP)" in translated  # the real cast target was translated
+
+
+@pytest.mark.spark
+def test_tstz_cast_translation_raises_on_quoted_identifier():
+    """The phrase inside a double-quoted identifier is neither a CAST
+    target, a string literal, nor a comment -- the shim doesn't understand
+    it, so it must raise rather than silently rewrite (or silently leave
+    unrewritten and un-flagged) a query it cannot faithfully translate.
+    """
+    from src.lakehouse.engines.spark_engine import _translate_tstz_cast
+
+    query = 'SELECT 1 AS "AS TIMESTAMP WITH TIME ZONE"'
+    with pytest.raises(ValueError, match="TIMESTAMP WITH TIME ZONE"):
+        _translate_tstz_cast(query)
