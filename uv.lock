@@ -63,7 +63,7 @@ spark = [
 
 [package.metadata]
 requires-dist = [
-    { name = "duckdb", specifier = ">=1.0.0" },
+    { name = "duckdb", specifier = ">=1.5.0" },
     { name = "langgraph", specifier = ">=0.2.0" },
     { name = "numpy", specifier = ">=1.26.0" },
     { name = "pandas", specifier = ">=2.2.0" },

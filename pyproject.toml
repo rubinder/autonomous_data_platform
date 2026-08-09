@@ -9,7 +9,7 @@ requires-python = ">=3.11"
 dependencies = [
     "pyiceberg[sql-sqlite,pyarrow]>=0.7.0",
     "pyarrow>=16.0.0",
-    "duckdb>=1.0.0",
+    "duckdb>=1.5.0",  # DuckDBPyResult.to_arrow_table()
     "pandas>=2.2.0",
     "numpy>=1.26.0",
     "scikit-learn>=1.5.0",
