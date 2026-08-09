@@ -1,12 +1,37 @@
 table: bronze.yodlee_transactions_raw
 version: 1
 owner: data-platform
+# Declares every non-underscore column bronze.yodlee_transactions_raw actually
+# has (derived from schemas.BRONZE_TRANSACTIONS), not just the handful the
+# pipeline enforces expectations on. Leaving columns undeclared makes the ops
+# agent (Task 15) flag every one of them as an `added` schema_drift finding
+# on every run -- correctly classified `additive`, but exactly the alert
+# noise the additive/breaking split exists to prevent.
 schema:
   - {name: id, type: long, nullable: false}
+  - {name: accountId, type: long, nullable: true}
+  - {name: date, type: string, nullable: true}
   - {name: transactionDate, type: string, nullable: true}
-  - {name: baseType, type: string, nullable: true}
+  - {name: postDate, type: string, nullable: true}
   - {name: amount, type: struct, nullable: true}
+  - {name: runningBalance, type: struct, nullable: true}
   - {name: merchant, type: struct, nullable: true}
+  - {name: status, type: string, nullable: true}
+  - {name: baseType, type: string, nullable: true}
+  - {name: subType, type: string, nullable: true}
+  - {name: category, type: string, nullable: true}
+  - {name: categoryType, type: string, nullable: true}
+  - {name: categoryId, type: long, nullable: true}
+  - {name: detailCategoryId, type: long, nullable: true}
+  - {name: detailCategory, type: string, nullable: true}
+  - {name: highLevelCategoryId, type: long, nullable: true}
+  - {name: categorySource, type: string, nullable: true}
+  - {name: sourceType, type: string, nullable: true}
+  - {name: checkNumber, type: string, nullable: true}
+  - {name: isManual, type: boolean, nullable: true}
+  - {name: container, type: string, nullable: true}
+  - {name: createdDate, type: string, nullable: true}
+  - {name: lastUpdated, type: string, nullable: true}
   - {name: _ingested_at, type: timestamptz, nullable: false}
 expectations:
   - {type: not_null, column: id}
