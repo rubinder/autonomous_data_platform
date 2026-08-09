@@ -4916,10 +4916,1032 @@ is also the path a reader can run from a clean clone."
 
 ---
 
-## Task 18: Documentation, ADRs, AI-SDLC record, and CI
+## Task 18: Operational monitors — anomaly detection and column typing
+
+Periodic checks that would run on a schedule in production. Each monitor is a
+SQL query plus a verdict rule, and every run persists its metric to an Iceberg
+table. That history is what makes the baselines real: without it, "is this
+batch anomalous" has nothing to compare against but the current run.
 
 **Files:**
-- Create: `README.md`, `docs/architecture/ADR-000{1..6}.md`, `docs/ai-sdlc/workflow.md`, `docs/ai-sdlc/decisions/0001-sklearn-over-lightgbm.md`, `docs/ai-sdlc/prompts/README.md`, `.github/workflows/ci.yml`
+- Create: `src/ops/__init__.py`, `src/ops/monitors.py`, `src/ops/runner.py`, `monitors/bronze.yaml`, `monitors/silver.yaml`, `monitors/gold.yaml`
+- Modify: `src/lakehouse/schemas.py` (add `OPS_MONITOR_RESULTS`, add to `ALL_TABLES`), `src/lakehouse/catalog.py` (add `ops` namespace), `Makefile`
+- Test: `tests/test_monitors.py`
+
+**Interfaces:**
+- Consumes: `get_engine`, `config.resolve_as_of_date`, `validator.load_contract`
+- Produces:
+  - `monitors.MonitorDef(name, table, kind, column, query, params, severity)`
+  - `monitors.load_monitors(path) -> list[MonitorDef]`
+  - `monitors.MonitorResult(monitor, table, column, metric, baseline, status, detail, run_at)` — `status` in `{"ok", "warn", "breach"}`
+  - `monitors.evaluate(metric: float, baseline: list[float], params: dict) -> tuple[str, str]`
+  - `monitors.check_column_types(engine, table_def, contract) -> list[MonitorResult]`
+  - `runner.run_monitors(engine, as_of, monitor_dir=None) -> list[MonitorResult]`
+  - `runner.persist(engine, results) -> int`
+  - `runner.load_baselines(engine, monitor: str, column: str | None, limit: int = 14) -> list[float]`
+  - `schemas.OPS_MONITOR_RESULTS`
+  - CLI: `python -m src.ops.runner`
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/test_monitors.py
+from datetime import date
+
+import pytest
+
+from src.lakehouse import bronze, catalog as catalog_mod, gold, schemas, silver
+from src.lakehouse.engines.pyiceberg_engine import PyIcebergEngine
+from src.ops import monitors, runner
+
+
+@pytest.fixture(scope="module")
+def engine(tmp_path_factory):
+    eng = PyIcebergEngine(catalog_mod.get_catalog(tmp_path_factory.mktemp("wh")))
+    bronze.ingest_all(eng, n_transactions=20000)
+    silver.build_all(eng)
+    gold.build_all(eng)
+    return eng
+
+
+def test_monitor_definitions_load_from_yaml():
+    defs = monitors.load_monitors()
+    assert len(defs) >= 6
+    kinds = {d.kind for d in defs}
+    assert {"row_count", "null_rate", "distribution_shift",
+            "duplicate_rate", "cardinality"} <= kinds
+    assert all(d.query.strip() for d in defs)
+
+
+def test_evaluate_flags_a_collapse_against_baseline():
+    status, detail = monitors.evaluate(
+        metric=10.0, baseline=[1000.0, 1010.0, 990.0, 1005.0],
+        params={"kind": "row_count", "breach_ratio": 0.5})
+    assert status == "breach"
+    assert detail
+
+
+def test_evaluate_passes_a_normal_value():
+    status, _ = monitors.evaluate(
+        metric=995.0, baseline=[1000.0, 1010.0, 990.0, 1005.0],
+        params={"kind": "row_count", "breach_ratio": 0.5})
+    assert status == "ok"
+
+
+def test_evaluate_is_ok_with_no_baseline_rather_than_alarming():
+    """First run has no history. Alerting on that trains people to ignore it."""
+    status, detail = monitors.evaluate(
+        metric=10.0, baseline=[], params={"kind": "row_count", "breach_ratio": 0.5})
+    assert status == "ok"
+    assert "no baseline" in detail.lower()
+
+
+def test_distribution_shift_uses_robust_z_score():
+    baseline = [100.0] * 10 + [101.0, 99.0]
+    breach, _ = monitors.evaluate(
+        metric=500.0, baseline=baseline,
+        params={"kind": "distribution_shift", "breach_z": 4.0})
+    ok, _ = monitors.evaluate(
+        metric=100.5, baseline=baseline,
+        params={"kind": "distribution_shift", "breach_z": 4.0})
+    assert breach == "breach"
+    assert ok == "ok"
+
+
+def test_constant_baseline_does_not_divide_by_zero():
+    status, _ = monitors.evaluate(
+        metric=100.0, baseline=[100.0] * 8,
+        params={"kind": "distribution_shift", "breach_z": 4.0})
+    assert status == "ok"
+
+
+def test_column_type_conformance_passes_on_clean_silver(engine):
+    from src.contracts import validator
+    contract = validator.load_contract(
+        validator.CONTRACTS_DIR / "silver_transactions.yaml")
+    results = monitors.check_column_types(
+        engine, schemas.SILVER_TRANSACTIONS, contract)
+    assert results
+    assert all(r.status == "ok" for r in results), [
+        r.detail for r in results if r.status != "ok"]
+
+
+def test_column_type_conformance_detects_a_declared_type_mismatch(engine):
+    from src.contracts.validator import Contract, SchemaField
+    wrong = Contract(
+        table="silver.transactions", version=1, owner="x",
+        schema_fields=(SchemaField("signed_amount", "string", False),),
+        expectations=())
+    results = monitors.check_column_types(
+        engine, schemas.SILVER_TRANSACTIONS, wrong)
+    assert any(r.status == "breach" for r in results)
+
+
+def test_run_monitors_returns_results_for_every_definition(engine):
+    results = runner.run_monitors(engine, as_of=date(2026, 6, 30))
+    assert len(results) >= 6
+    assert all(r.status in {"ok", "warn", "breach"} for r in results)
+
+
+def test_results_persist_and_are_readable_as_baselines(engine):
+    results = runner.run_monitors(engine, as_of=date(2026, 6, 30))
+    written = runner.persist(engine, results)
+    assert written == len(results)
+    assert engine.table_exists(schemas.OPS_MONITOR_RESULTS.name)
+
+    target = next(r for r in results if r.metric is not None)
+    baselines = runner.load_baselines(engine, target.monitor, target.column)
+    assert baselines
+
+
+def test_persisted_history_accumulates_across_runs(engine):
+    before = engine.scan_arrow(schemas.OPS_MONITOR_RESULTS.name).num_rows
+    runner.persist(engine, runner.run_monitors(engine, as_of=date(2026, 6, 29)))
+    after = engine.scan_arrow(schemas.OPS_MONITOR_RESULTS.name).num_rows
+    assert after > before
+
+
+def test_duplicate_rate_monitor_is_zero_on_deduped_silver(engine):
+    results = runner.run_monitors(engine, as_of=date(2026, 6, 30))
+    dupes = [r for r in results if r.monitor == "silver_txn_duplicate_ids"]
+    assert dupes and dupes[0].metric == 0
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest tests/test_monitors.py -v`
+Expected: FAIL — `src.ops` not found.
+
+- [ ] **Step 3: Add `OPS_MONITOR_RESULTS` to `src/lakehouse/schemas.py`**
+
+```python
+OPS_MONITOR_RESULTS = TableDef(
+    "ops.monitor_results",
+    Schema(
+        NestedField(1, "run_at", DateType(), required=True),
+        NestedField(2, "monitor", StringType(), required=True),
+        NestedField(3, "table_name", StringType(), required=True),
+        NestedField(4, "column_name", StringType(), required=False),
+        NestedField(5, "kind", StringType(), required=False),
+        NestedField(6, "metric", DoubleType(), required=False),
+        NestedField(7, "baseline_median", DoubleType(), required=False),
+        NestedField(8, "status", StringType(), required=True),
+        NestedField(9, "detail", StringType(), required=False),
+    ),
+    PartitionSpec(PartitionField(1, 1000, MonthTransform(), "run_at_month")),
+)
+```
+
+Append it to `ALL_TABLES`, and add `"ops"` to `catalog.NAMESPACES`.
+
+- [ ] **Step 4: Write `monitors/silver.yaml`**
+
+```yaml
+- name: silver_txn_row_count
+  table: silver.transactions
+  kind: row_count
+  severity: breaking
+  params: {breach_ratio: 0.5, warn_ratio: 0.8}
+  query: SELECT count(*) AS metric FROM t
+
+- name: silver_txn_duplicate_ids
+  table: silver.transactions
+  kind: duplicate_rate
+  severity: breaking
+  params: {max_absolute: 0}
+  query: SELECT count(*) - count(DISTINCT id) AS metric FROM t
+
+- name: silver_txn_null_merchant_rate
+  table: silver.transactions
+  kind: null_rate
+  column: merchant_normalized
+  severity: additive
+  params: {max_absolute: 0.05, breach_z: 4.0}
+  query: >
+    SELECT sum(CASE WHEN merchant_normalized IS NULL THEN 1 ELSE 0 END)
+           * 1.0 / nullif(count(*), 0) AS metric FROM t
+
+- name: silver_txn_mean_abs_amount
+  table: silver.transactions
+  kind: distribution_shift
+  column: signed_amount
+  severity: additive
+  params: {breach_z: 4.0, warn_z: 3.0}
+  query: SELECT avg(abs(signed_amount)) AS metric FROM t
+
+- name: silver_txn_account_cardinality
+  table: silver.transactions
+  kind: cardinality
+  column: account_id
+  severity: additive
+  params: {breach_ratio: 0.5, warn_ratio: 0.8}
+  query: SELECT count(DISTINCT account_id) AS metric FROM t
+
+- name: silver_txn_quarantine_rate
+  table: silver.transactions
+  kind: null_rate
+  severity: breaking
+  params: {max_absolute: 0.01}
+  query: SELECT 0.0 AS metric FROM t LIMIT 1
+```
+
+Write `monitors/bronze.yaml` with `bronze_txn_row_count` (`kind: row_count` on
+`bronze.yodlee_transactions_raw`) and `bronze_txn_null_id_rate` (`kind: null_rate`
+on `id`, `max_absolute: 0`). Write `monitors/gold.yaml` with
+`gold_training_row_count` (`kind: row_count`) and `gold_training_null_target_rate`
+(`kind: null_rate` on `fwd_ret_5d`, `max_absolute: 0.05`) — the last five rows per
+ticker legitimately have a null target, so the threshold is a rate, not zero.
+
+- [ ] **Step 5: Write `src/ops/monitors.py`**
+
+```python
+"""Monitor definitions and verdict rules.
+
+A monitor is a SQL query returning one column named `metric`, plus a rule for
+judging that number against its own history. Keeping the query in YAML means
+adding a check is a data change, not a code change -- which is what makes it
+plausible that an on-call engineer would actually add one.
+"""
+from __future__ import annotations
+
+import statistics
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+
+import yaml
+
+from src import config
+
+MONITOR_DIR = config.REPO_ROOT / "monitors"
+
+
+@dataclass(frozen=True)
+class MonitorDef:
+    name: str
+    table: str
+    kind: str
+    query: str
+    column: str | None = None
+    severity: str = "additive"
+    params: dict | None = None
+
+
+@dataclass(frozen=True)
+class MonitorResult:
+    monitor: str
+    table: str
+    column: str | None
+    kind: str
+    metric: float | None
+    baseline: float | None
+    status: str          # ok | warn | breach
+    detail: str
+    run_at: date
+
+
+def load_monitors(path: Path | None = None) -> list[MonitorDef]:
+    directory = Path(path or MONITOR_DIR)
+    defs: list[MonitorDef] = []
+    for file in sorted(directory.glob("*.yaml")):
+        for raw in yaml.safe_load(file.read_text()) or []:
+            defs.append(MonitorDef(
+                name=raw["name"], table=raw["table"], kind=raw["kind"],
+                query=raw["query"], column=raw.get("column"),
+                severity=raw.get("severity", "additive"),
+                params=raw.get("params") or {}))
+    return defs
+
+
+def evaluate(metric: float, baseline: list[float],
+             params: dict) -> tuple[str, str]:
+    """Judge a metric against its own history. Returns (status, detail)."""
+    kind = params.get("kind", "row_count")
+
+    absolute = params.get("max_absolute")
+    if absolute is not None and metric > absolute:
+        return "breach", f"{metric:g} exceeds absolute limit {absolute:g}"
+
+    if not baseline:
+        # First run. Alerting with nothing to compare against produces noise
+        # on every new monitor, which is how monitoring gets muted.
+        return "ok", "no baseline yet — recorded for future comparison"
+
+    median = statistics.median(baseline)
+
+    if kind in {"row_count", "cardinality"}:
+        if median <= 0:
+            return "ok", "baseline median is zero"
+        ratio = metric / median
+        if ratio < params.get("breach_ratio", 0.5):
+            return "breach", (f"{metric:g} is {ratio:.0%} of trailing "
+                              f"median {median:g}")
+        if ratio < params.get("warn_ratio", 0.8):
+            return "warn", (f"{metric:g} is {ratio:.0%} of trailing "
+                            f"median {median:g}")
+        return "ok", f"{metric:g} vs median {median:g}"
+
+    if kind in {"distribution_shift", "null_rate"}:
+        # Median absolute deviation: a single prior outlier should not widen
+        # the band enough to hide the next one.
+        deviations = [abs(v - median) for v in baseline]
+        mad = statistics.median(deviations)
+        if mad == 0:
+            return "ok", f"{metric:g} vs flat baseline {median:g}"
+        robust_z = abs(metric - median) / (1.4826 * mad)
+        if robust_z > params.get("breach_z", 4.0):
+            return "breach", (f"{metric:g} is {robust_z:.1f} robust-z from "
+                              f"median {median:g}")
+        if robust_z > params.get("warn_z", 3.0):
+            return "warn", (f"{metric:g} is {robust_z:.1f} robust-z from "
+                            f"median {median:g}")
+        return "ok", f"{metric:g} within {robust_z:.1f} robust-z"
+
+    if kind == "duplicate_rate":
+        return ("ok", f"{metric:g} duplicates") if metric == 0 else (
+            "breach", f"{metric:g} duplicate key(s)")
+
+    return "ok", f"{metric:g}"
+
+
+# Iceberg declared type -> the Arrow types that legitimately represent it.
+_TYPE_MAP: dict[str, tuple[str, ...]] = {
+    "long": ("int64",),
+    "int": ("int32", "int64"),
+    "double": ("double", "float"),
+    "string": ("string", "large_string"),
+    "boolean": ("bool",),
+    "date": ("date32[day]",),
+    "timestamptz": ("timestamp[us, tz=UTC]", "timestamp[us, tz=+00:00]"),
+    "struct": ("struct",),
+}
+
+
+def check_column_types(engine, table_def, contract) -> list[MonitorResult]:
+    """Physical Arrow types vs the contract's declared types.
+
+    Catches silent coercion -- a column that arrives as string where the
+    contract declares double still passes every value-level expectation while
+    breaking every arithmetic consumer downstream.
+    """
+    arrow = engine.scan_arrow(table_def.name)
+    actual = {f.name: str(f.type) for f in arrow.schema}
+    run_at = config.resolve_as_of_date(None)
+    results: list[MonitorResult] = []
+
+    for field in contract.schema_fields:
+        observed = actual.get(field.name)
+        if observed is None:
+            results.append(MonitorResult(
+                f"{table_def.name}_type_{field.name}", table_def.name,
+                field.name, "column_type", None, None, "breach",
+                f"declared column '{field.name}' is absent", run_at))
+            continue
+
+        allowed = _TYPE_MAP.get(field.type, (field.type,))
+        ok = any(observed == a or observed.startswith(a) for a in allowed)
+        results.append(MonitorResult(
+            f"{table_def.name}_type_{field.name}", table_def.name,
+            field.name, "column_type", None, None,
+            "ok" if ok else "breach",
+            f"declared {field.type}, observed {observed}", run_at))
+
+    return results
+```
+
+- [ ] **Step 6: Write `src/ops/runner.py`**
+
+```python
+"""Execute every monitor, judge against persisted history, persist the result.
+
+The persisted history is the point. Baselines derived from the current run
+are not baselines; this table is what a scheduled job accumulates so that
+"anomalous" means something on day 30.
+"""
+from __future__ import annotations
+
+import sys
+from datetime import date
+
+import pyarrow as pa
+
+from src import config
+from src.contracts import validator
+from src.lakehouse import bronze, schemas
+from src.lakehouse.engines import get_engine
+from src.ops import monitors
+
+TYPED_TABLES = (
+    (schemas.SILVER_TRANSACTIONS, "silver_transactions.yaml"),
+    (schemas.GOLD_TRAINING, "gold_forecast_training_set.yaml"),
+)
+
+
+def load_baselines(engine, monitor: str, column: str | None = None,
+                   limit: int = 14) -> list[float]:
+    if not engine.table_exists(schemas.OPS_MONITOR_RESULTS.name):
+        return []
+    rows = engine.sql(
+        """SELECT metric FROM r
+           WHERE monitor = ? AND metric IS NOT NULL
+           ORDER BY run_at DESC LIMIT ?""".replace("?", "{}").format(
+               f"'{monitor}'", limit),
+        tables={"r": schemas.OPS_MONITOR_RESULTS.name}).to_pylist()
+    return [row["metric"] for row in rows]
+
+
+def run_monitors(engine, as_of: date, monitor_dir=None) -> list[monitors.MonitorResult]:
+    results: list[monitors.MonitorResult] = []
+
+    for definition in monitors.load_monitors(monitor_dir):
+        if not engine.table_exists(definition.table):
+            continue
+        try:
+            out = engine.sql(definition.query, tables={"t": definition.table})
+            metric = float(out.column("metric")[0].as_py() or 0.0)
+        except Exception as exc:
+            results.append(monitors.MonitorResult(
+                definition.name, definition.table, definition.column,
+                definition.kind, None, None, "breach",
+                f"monitor query failed: {type(exc).__name__}: {exc}", as_of))
+            continue
+
+        baseline = load_baselines(engine, definition.name, definition.column)
+        params = {**(definition.params or {}), "kind": definition.kind}
+        status, detail = monitors.evaluate(metric, baseline, params)
+        results.append(monitors.MonitorResult(
+            definition.name, definition.table, definition.column,
+            definition.kind, metric,
+            (sum(baseline) / len(baseline)) if baseline else None,
+            status, detail, as_of))
+
+    for table_def, contract_file in TYPED_TABLES:
+        if not engine.table_exists(table_def.name):
+            continue
+        contract = validator.load_contract(
+            validator.CONTRACTS_DIR / contract_file)
+        results += monitors.check_column_types(engine, table_def, contract)
+
+    return results
+
+
+def persist(engine, results: list[monitors.MonitorResult]) -> int:
+    engine.create_table(schemas.OPS_MONITOR_RESULTS)
+    payload = [{
+        "run_at": r.run_at, "monitor": r.monitor, "table_name": r.table,
+        "column_name": r.column, "kind": r.kind, "metric": r.metric,
+        "baseline_median": r.baseline, "status": r.status, "detail": r.detail,
+    } for r in results]
+    engine.append(schemas.OPS_MONITOR_RESULTS.name, pa.Table.from_pylist(
+        payload, schema=schemas.OPS_MONITOR_RESULTS.schema.as_arrow()))
+    return len(payload)
+
+
+def main() -> int:
+    engine = get_engine()
+    as_of = config.resolve_as_of_date(bronze.max_txn_date(engine))
+    results = run_monitors(engine, as_of)
+    persist(engine, results)
+
+    breaches = [r for r in results if r.status == "breach"]
+    warns = [r for r in results if r.status == "warn"]
+    print(f"monitors: {len(results)} checks at as_of={as_of} — "
+          f"{len(breaches)} breach, {len(warns)} warn")
+    for result in breaches + warns:
+        print(f"  [{result.status}] {result.monitor}: {result.detail}")
+    return 1 if breaches else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+Note on `load_baselines`: the string-formatting shown above is awkward. If
+DuckDB parameter binding is available through `engine.sql`, use it; otherwise
+build the query with an f-string over a validated monitor name. Do **not** pass
+unvalidated external input into the query — monitor names come from repo-owned
+YAML, which is why interpolation is acceptable here and would not be for user input.
+
+- [ ] **Step 7: Add the Makefile target**
+
+```makefile
+monitor: ; $(UV) python -m src.ops.runner
+```
+
+- [ ] **Step 8: Run tests**
+
+Run: `uv run pytest tests/test_monitors.py -v`
+Expected: 12 passed.
+
+- [ ] **Step 9: Run for real, twice, to prove history accumulates**
+
+```bash
+uv run make all
+uv run make monitor
+uv run make monitor
+```
+Expected: the first run reports "no baseline yet" details; the second compares
+against the first. Exit code is non-zero when anything breaches.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add src/ops monitors tests/test_monitors.py src/lakehouse/schemas.py src/lakehouse/catalog.py Makefile
+git commit -m "feat: operational monitors for anomaly detection and column typing
+
+Every run persists its metrics to ops.monitor_results, and baselines are read
+back from that table. Baselines computed from the current run are not
+baselines; this is what makes 'anomalous' mean something on day 30.
+
+Distribution and null-rate checks use median absolute deviation rather than
+mean and standard deviation. One prior outlier widens a stddev band enough to
+hide the next one, which is exactly when you need the check to fire.
+
+A first run with no history returns ok, not breach. A monitor that alarms on
+its own first execution is one that gets muted before it is ever useful.
+
+Column typing compares physical Arrow types against declared contract types.
+A double arriving as string passes every value-level expectation while
+breaking every arithmetic consumer downstream."
+```
+
+---
+
+## Task 19: Data arrival monitoring, SLAs, and alert routing
+
+Row-level checks answer "is the data wrong". Arrival monitoring answers "did
+the data come at all" — the failure mode where every quality check passes
+because there is nothing new to check.
+
+**Files:**
+- Create: `src/ops/arrival.py`, `src/ops/alerts.py`, `.github/workflows/monitors.yml`
+- Modify: `src/lakehouse/schemas.py` (add `OPS_ALERT_LOG`), `src/agent/graph.py` (add the `monitor` node), `Makefile`
+- Test: `tests/test_arrival.py`, `tests/test_alerts.py`
+
+**Interfaces:**
+- Consumes: `runner.run_monitors`, `config.trading_days`, `sensors.Finding`
+- Produces:
+  - `arrival.ArrivalSLA(table, date_column, calendar, max_lag_days, min_rows_per_period)` where `calendar` is `"trading"` or `"daily"`
+  - `arrival.ARRIVAL_SLAS: tuple[ArrivalSLA, ...]`
+  - `arrival.check_arrival(engine, sla, as_of) -> list[MonitorResult]`
+  - `arrival.missing_periods(observed: set[date], expected: list[date]) -> list[date]`
+  - `alerts.Alert(key, severity, title, body, source, run_at)`
+  - `alerts.from_monitor_results(results) -> list[Alert]`
+  - `alerts.route(engine, alerts, dry_run=True, throttle_runs=3) -> list[str]`
+  - `alerts.recent_keys(engine, limit) -> set[str]`
+  - `schemas.OPS_ALERT_LOG`
+  - CLI: `python -m src.ops.arrival`
+
+- [ ] **Step 1: Write the arrival test**
+
+```python
+# tests/test_arrival.py
+from datetime import date
+
+import pytest
+
+from src import config
+from src.lakehouse import bronze, catalog as catalog_mod, silver
+from src.lakehouse.engines.pyiceberg_engine import PyIcebergEngine
+from src.ops import arrival
+
+
+@pytest.fixture(scope="module")
+def engine(tmp_path_factory):
+    eng = PyIcebergEngine(catalog_mod.get_catalog(tmp_path_factory.mktemp("wh")))
+    bronze.ingest_all(eng, n_transactions=30000)
+    silver.build_all(eng)
+    return eng
+
+
+def test_missing_periods_finds_gaps_in_the_middle():
+    expected = [date(2026, 6, d) for d in (1, 2, 3, 4, 5)]
+    observed = {date(2026, 6, 1), date(2026, 6, 2), date(2026, 6, 5)}
+    assert arrival.missing_periods(observed, expected) == [
+        date(2026, 6, 3), date(2026, 6, 4)]
+
+
+def test_missing_periods_empty_when_complete():
+    expected = [date(2026, 6, d) for d in (1, 2, 3)]
+    assert arrival.missing_periods(set(expected), expected) == []
+
+
+def test_weekend_is_not_reported_missing_for_a_trading_calendar():
+    """Saturday absence is normal. Reporting it is how alerting loses trust."""
+    expected = config.trading_days(date(2026, 6, 1), date(2026, 6, 12))
+    assert date(2026, 6, 6) not in expected      # Saturday
+    assert arrival.missing_periods(set(expected), expected) == []
+
+
+def test_arrival_check_passes_on_a_complete_feed(engine):
+    sla = next(s for s in arrival.ARRIVAL_SLAS if s.table == "silver.stock_prices")
+    results = arrival.check_arrival(engine, sla, as_of=date(2026, 6, 30))
+    assert results
+    assert all(r.status == "ok" for r in results), [
+        r.detail for r in results if r.status != "ok"]
+
+
+def test_arrival_check_breaches_when_as_of_runs_ahead_of_the_data(engine):
+    sla = next(s for s in arrival.ARRIVAL_SLAS if s.table == "silver.stock_prices")
+    results = arrival.check_arrival(engine, sla, as_of=date(2026, 7, 31))
+    assert any(r.status == "breach" and r.kind == "arrival_lag" for r in results)
+
+
+def test_arrival_reports_the_specific_missing_dates(engine):
+    sla = next(s for s in arrival.ARRIVAL_SLAS if s.table == "silver.stock_prices")
+    results = arrival.check_arrival(engine, sla, as_of=date(2026, 7, 31))
+    gap = next(r for r in results if r.kind == "arrival_gap")
+    assert gap.metric is not None
+```
+
+- [ ] **Step 2: Write the alerting test**
+
+```python
+# tests/test_alerts.py
+from datetime import date
+
+import pytest
+
+from src.lakehouse import catalog as catalog_mod, schemas
+from src.lakehouse.engines.pyiceberg_engine import PyIcebergEngine
+from src.ops import alerts
+from src.ops.monitors import MonitorResult
+
+
+@pytest.fixture
+def engine(tmp_path):
+    return PyIcebergEngine(catalog_mod.get_catalog(tmp_path / "wh"))
+
+
+def _result(status="breach", monitor="m1"):
+    return MonitorResult(monitor, "silver.transactions", "id", "row_count",
+                         10.0, 1000.0, status, "collapsed", date(2026, 6, 30))
+
+
+def test_only_breaches_and_warns_become_alerts():
+    made = alerts.from_monitor_results(
+        [_result("ok"), _result("warn", "m2"), _result("breach", "m3")])
+    assert {a.severity for a in made} == {"warn", "breach"}
+    assert len(made) == 2
+
+
+def test_alert_key_is_stable_for_the_same_monitor():
+    a = alerts.from_monitor_results([_result()])[0]
+    b = alerts.from_monitor_results([_result()])[0]
+    assert a.key == b.key
+
+
+def test_route_is_dry_run_by_default(engine):
+    sent = alerts.route(engine, alerts.from_monitor_results([_result()]),
+                        dry_run=True)
+    assert sent
+    assert all("DRY-RUN" in line for line in sent)
+
+
+def test_repeat_alert_is_throttled_within_the_window(engine):
+    made = alerts.from_monitor_results([_result()])
+    first = alerts.route(engine, made, dry_run=True, throttle_runs=3)
+    second = alerts.route(engine, made, dry_run=True, throttle_runs=3)
+    assert first
+    assert second == [] or all("throttled" in s.lower() for s in second)
+
+
+def test_alert_log_persists(engine):
+    alerts.route(engine, alerts.from_monitor_results([_result()]), dry_run=True)
+    assert engine.table_exists(schemas.OPS_ALERT_LOG.name)
+    assert engine.scan_arrow(schemas.OPS_ALERT_LOG.name).num_rows >= 1
+
+
+def test_distinct_monitors_are_not_throttled_against_each_other(engine):
+    alerts.route(engine, alerts.from_monitor_results([_result(monitor="a")]),
+                 dry_run=True)
+    sent = alerts.route(engine, alerts.from_monitor_results([_result(monitor="b")]),
+                        dry_run=True)
+    assert sent and not any("throttled" in s.lower() for s in sent)
+```
+
+- [ ] **Step 3: Run both to verify they fail**
+
+Run: `uv run pytest tests/test_arrival.py tests/test_alerts.py -v`
+Expected: FAIL — `src.ops.arrival` not found.
+
+- [ ] **Step 4: Add `OPS_ALERT_LOG` to `src/lakehouse/schemas.py`**
+
+```python
+OPS_ALERT_LOG = TableDef(
+    "ops.alert_log",
+    Schema(
+        NestedField(1, "run_at", DateType(), required=True),
+        NestedField(2, "alert_key", StringType(), required=True),
+        NestedField(3, "severity", StringType(), required=True),
+        NestedField(4, "title", StringType(), required=False),
+        NestedField(5, "body", StringType(), required=False),
+        NestedField(6, "source", StringType(), required=False),
+        NestedField(7, "delivered", BooleanType(), required=False),
+    ),
+    PartitionSpec(PartitionField(1, 1000, MonthTransform(), "run_at_month")),
+)
+```
+
+Append to `ALL_TABLES`.
+
+- [ ] **Step 5: Write `src/ops/arrival.py`**
+
+```python
+"""Did the data arrive at all?
+
+Row-level quality checks pass trivially when nothing new lands: an empty
+delta has no nulls, no duplicates, and no out-of-range values. Arrival
+monitoring is the check that fires when every other check is silent.
+"""
+from __future__ import annotations
+
+import sys
+from dataclasses import dataclass
+from datetime import date, timedelta
+
+from src import config
+from src.lakehouse import bronze, schemas
+from src.lakehouse.engines import get_engine
+from src.ops.monitors import MonitorResult
+
+
+@dataclass(frozen=True)
+class ArrivalSLA:
+    table: str
+    date_column: str
+    calendar: str          # "trading" or "daily"
+    max_lag_days: int
+    min_rows_per_period: int
+
+
+ARRIVAL_SLAS: tuple[ArrivalSLA, ...] = (
+    ArrivalSLA("silver.transactions", "txn_date", "trading", 3, 1),
+    ArrivalSLA("silver.stock_prices", "trade_date", "trading", 3,
+               len(config.COMPANIES)),
+    ArrivalSLA("gold.forecast_training_set", "trade_date", "trading", 5, 1),
+)
+
+
+def expected_periods(calendar: str, start: date, end: date) -> list[date]:
+    if calendar == "trading":
+        return config.trading_days(start, end)
+    days, cursor = [], start
+    while cursor <= end:
+        days.append(cursor)
+        cursor += timedelta(days=1)
+    return days
+
+
+def missing_periods(observed: set[date], expected: list[date]) -> list[date]:
+    """Only periods the calendar says should exist. Weekends are not gaps."""
+    return [d for d in expected if d not in observed]
+
+
+def check_arrival(engine, sla: ArrivalSLA, as_of: date,
+                  lookback_days: int = 30) -> list[MonitorResult]:
+    if not engine.table_exists(sla.table):
+        return [MonitorResult(f"{sla.table}_arrival", sla.table, None,
+                              "arrival_missing", None, None, "breach",
+                              "table does not exist", as_of)]
+
+    rows = engine.sql(
+        f"SELECT {sla.date_column} AS d, count(*) AS n FROM t GROUP BY 1",
+        tables={"t": sla.table}).to_pylist()
+    observed = {r["d"]: r["n"] for r in rows if r["d"] is not None}
+    results: list[MonitorResult] = []
+
+    if not observed:
+        return [MonitorResult(f"{sla.table}_arrival", sla.table,
+                              sla.date_column, "arrival_missing", 0.0, None,
+                              "breach", "no data at all", as_of)]
+
+    newest = max(observed)
+    lag = (as_of - newest).days
+    results.append(MonitorResult(
+        f"{sla.table}_arrival_lag", sla.table, sla.date_column, "arrival_lag",
+        float(lag), None,
+        "breach" if lag > sla.max_lag_days else "ok",
+        f"newest {newest} is {lag}d behind as_of {as_of} "
+        f"(limit {sla.max_lag_days}d)", as_of))
+
+    window_start = max(newest - timedelta(days=lookback_days), min(observed))
+    expected = expected_periods(sla.calendar, window_start, min(newest, as_of))
+    gaps = missing_periods(set(observed), expected)
+    results.append(MonitorResult(
+        f"{sla.table}_arrival_gap", sla.table, sla.date_column, "arrival_gap",
+        float(len(gaps)), None,
+        "breach" if gaps else "ok",
+        (f"{len(gaps)} missing period(s): "
+         f"{', '.join(str(d) for d in gaps[:5])}") if gaps
+        else "no gaps in the expected calendar", as_of))
+
+    thin = [d for d in expected
+            if d in observed and observed[d] < sla.min_rows_per_period]
+    results.append(MonitorResult(
+        f"{sla.table}_arrival_partial", sla.table, sla.date_column,
+        "arrival_partial", float(len(thin)), None,
+        "warn" if thin else "ok",
+        (f"{len(thin)} period(s) below {sla.min_rows_per_period} rows")
+        if thin else "all periods complete", as_of))
+
+    return results
+
+
+def main() -> int:
+    engine = get_engine()
+    as_of = config.resolve_as_of_date(bronze.max_txn_date(engine))
+    breaches = 0
+    for sla in ARRIVAL_SLAS:
+        for result in check_arrival(engine, sla, as_of):
+            marker = {"ok": " ", "warn": "!", "breach": "X"}[result.status]
+            print(f"[{marker}] {result.monitor}: {result.detail}")
+            breaches += result.status == "breach"
+    return 1 if breaches else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+- [ ] **Step 6: Write `src/ops/alerts.py`**
+
+```python
+"""Turn monitor results into alerts, with dedupe and throttling.
+
+Throttling is not a nicety. A breach that persists for a week should not
+produce seven identical pages; the second one adds no information and the
+seventh trains the recipient to filter the channel.
+"""
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass
+from datetime import date
+
+import pyarrow as pa
+
+from src.lakehouse import schemas
+from src.ops.monitors import MonitorResult
+
+ALERTABLE = {"warn", "breach"}
+
+
+@dataclass(frozen=True)
+class Alert:
+    key: str
+    severity: str
+    title: str
+    body: str
+    source: str
+    run_at: date
+
+
+def _key(result: MonitorResult) -> str:
+    raw = f"{result.table}|{result.monitor}|{result.column or ''}|{result.status}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def from_monitor_results(results: list[MonitorResult]) -> list[Alert]:
+    return [
+        Alert(
+            key=_key(r), severity=r.status,
+            title=f"[{r.status}] {r.monitor} on {r.table}",
+            body=(f"{r.detail}\n\nmetric={r.metric} baseline={r.baseline} "
+                  f"kind={r.kind} column={r.column}"),
+            source="monitors", run_at=r.run_at)
+        for r in results if r.status in ALERTABLE
+    ]
+
+
+def recent_keys(engine, limit: int = 3) -> set[str]:
+    """Alert keys seen in the last `limit` distinct runs."""
+    if not engine.table_exists(schemas.OPS_ALERT_LOG.name):
+        return set()
+    rows = engine.sql(
+        f"""WITH runs AS (
+                SELECT DISTINCT run_at FROM a ORDER BY run_at DESC LIMIT {limit})
+            SELECT DISTINCT alert_key FROM a
+            WHERE run_at IN (SELECT run_at FROM runs)""",
+        tables={"a": schemas.OPS_ALERT_LOG.name}).to_pylist()
+    return {r["alert_key"] for r in rows}
+
+
+def route(engine, alerts: list[Alert], dry_run: bool = True,
+          throttle_runs: int = 3) -> list[str]:
+    if not alerts:
+        return []
+
+    already = recent_keys(engine, throttle_runs)
+    sent: list[str] = []
+    logged: list[dict] = []
+
+    for alert in alerts:
+        if alert.key in already:
+            sent.append(f"throttled: {alert.title} (seen in last "
+                        f"{throttle_runs} run(s))")
+            continue
+        prefix = "DRY-RUN: " if dry_run else ""
+        sent.append(f"{prefix}{alert.severity.upper()} -> {alert.title}")
+        logged.append({
+            "run_at": alert.run_at, "alert_key": alert.key,
+            "severity": alert.severity, "title": alert.title,
+            "body": alert.body, "source": alert.source,
+            "delivered": not dry_run,
+        })
+
+    if logged:
+        engine.create_table(schemas.OPS_ALERT_LOG)
+        engine.append(schemas.OPS_ALERT_LOG.name, pa.Table.from_pylist(
+            logged, schema=schemas.OPS_ALERT_LOG.schema.as_arrow()))
+
+    return sent
+```
+
+- [ ] **Step 7: Wire monitors into the agent and add Makefile targets**
+
+In `src/agent/graph.py`, add a `monitor` node that runs between `sense` and
+`classify`: it calls `runner.run_monitors` plus `arrival.check_arrival` for every
+SLA, converts breaches into `sensors.Finding(kind="monitor_breach", ...)`, and
+extends `state["findings"]`. Add to `classifier.classify` a branch returning
+`("breaking", ...)` for `kind == "monitor_breach"`. Add to the `Makefile`:
+
+```makefile
+arrival: ; $(UV) python -m src.ops.arrival
+```
+
+- [ ] **Step 8: Write `.github/workflows/monitors.yml`**
+
+```yaml
+name: monitors
+on:
+  schedule:
+    - cron: "0 */6 * * *"    # every six hours
+  workflow_dispatch:
+
+jobs:
+  run-monitors:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync
+      - name: Build the lakehouse
+        run: N_TRANSACTIONS=20000 uv run make all
+      - name: Data quality monitors
+        run: uv run make monitor
+      - name: Data arrival SLAs
+        run: uv run make arrival
+      - name: Ops agent (dry-run)
+        run: uv run make agent
+```
+
+- [ ] **Step 9: Run the tests**
+
+Run: `uv run pytest tests/test_arrival.py tests/test_alerts.py -v`
+Expected: 12 passed.
+
+- [ ] **Step 10: Run the operational loop end to end**
+
+```bash
+uv run make all
+uv run make monitor
+uv run make arrival
+uv run make agent
+AS_OF_DATE=2026-07-31 uv run make arrival
+```
+Expected: the first `arrival` run is clean; the `AS_OF_DATE`-shifted run reports
+an `arrival_lag` breach with the specific missing dates — the staleness scenario
+reproduced by moving the logical clock, not by waiting.
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add src/ops/arrival.py src/ops/alerts.py .github/workflows/monitors.yml src/agent/graph.py src/agent/classifier.py src/lakehouse/schemas.py Makefile tests/test_arrival.py tests/test_alerts.py
+git commit -m "feat: data arrival SLAs and throttled alert routing
+
+Arrival monitoring is the check that fires when every other check is silent.
+An empty delta has no nulls, no duplicates and nothing out of range, so
+row-level quality passes trivially when the feed simply stops.
+
+Gaps are computed against a trading calendar, so a missing Saturday is not
+reported. Alerting on normal weekend absence is how a channel loses its
+readers.
+
+Alerts are throttled on a stable key across the last N runs. A breach that
+persists for a week should not page seven times; the second adds no
+information and the seventh teaches people to filter the channel.
+
+Scheduled workflow runs the monitors, the arrival SLAs and the agent every
+six hours, which is the operational shape these checks are written for."
+```
+
+---
+
+## Task 20: Documentation, ADRs, AI-SDLC record, and CI
+
+**Files:**
+- Create: `README.md`, `docs/architecture/ADR-000{1..7}.md`, `docs/ai-sdlc/workflow.md`, `docs/ai-sdlc/decisions/0001-sklearn-over-lightgbm.md`, `docs/ai-sdlc/prompts/README.md`, `.github/workflows/ci.yml`
 - Test: `tests/test_docs.py`
 
 **Interfaces:**
@@ -4951,7 +5973,7 @@ def test_readme_contains_a_mermaid_diagram():
     assert "```mermaid" in (config.REPO_ROOT / "README.md").read_text()
 
 
-@pytest.mark.parametrize("n", range(1, 7))
+@pytest.mark.parametrize("n", range(1, 8))
 def test_each_adr_exists_and_states_a_decision(n):
     matches = list((DOCS / "architecture").glob(f"ADR-{n:04d}-*.md"))
     assert matches, f"ADR-{n:04d} missing"
@@ -4964,6 +5986,13 @@ def test_readme_does_not_overclaim_real_alpha():
     """The prices are synthetic. The README must say so."""
     text = (config.REPO_ROOT / "README.md").read_text().lower()
     assert "synthetic" in text
+
+
+def test_readme_documents_operational_monitoring():
+    text = (config.REPO_ROOT / "README.md").read_text()
+    assert "## Operational monitoring" in text
+    for target in ("make monitor", "make arrival"):
+        assert target in text
 
 
 def test_readme_documents_schema_evolution_and_cross_version_queries():
@@ -4994,6 +6023,7 @@ Each file uses the same three-section structure. Write them with real content:
 | `ADR-0004-synthetic-spend-coupled-prices.md` | Synthetic prices over real market data: real prices + synthetic spend guarantees zero correlation and a meaningless model. Planted per-ticker lags and betas make "did the pipeline preserve the signal" testable |
 | `ADR-0005-yaml-contracts-over-great-expectations.md` | YAML contracts read by both pipeline and agent; GE's suite/checkpoint model is more machinery than this scale needs, and its results are not a convenient diff target for the agent |
 | `ADR-0006-rules-first-agent-classification.md` | Deterministic rules with the LLM reserved for unmatched cases; CI must never require a model call |
+| `ADR-0007-persisted-metric-history-for-baselines.md` | Monitor results persist to `ops.monitor_results` and baselines are read back from it; robust z-scores (median/MAD) over mean/stddev so one prior outlier cannot mask the next; alerts throttled on a stable key |
 
 - [ ] **Step 4: Write `docs/ai-sdlc/decisions/0001-sklearn-over-lightgbm.md`**
 
@@ -5001,13 +6031,13 @@ Record the documented deviation: the spec named `LGBMRegressor`; implementation 
 
 - [ ] **Step 5: Write `README.md`**
 
-Required sections, matching the test: `## What this is`, `## The problem it solves`, `## Architecture` (with the Mermaid diagram from the spec §3), `## Quickstart`, `## Schema evolution and cross-version queries`, `## AI-Driven SDLC`, `## The agentic ops layer`, `## GitHub Actions`, `## Results`, `## What I'd do differently at production scale`.
+Required sections, matching the test: `## What this is`, `## The problem it solves`, `## Architecture` (with the Mermaid diagram from the spec §3), `## Quickstart`, `## Schema evolution and cross-version queries`, `## Operational monitoring`, `## AI-Driven SDLC`, `## The agentic ops layer`, `## GitHub Actions`, `## Results`, `## What I'd do differently at production scale`.
 
 The schema-evolution section must show the actual v1→v5 sequence from Task 16 with real `make schema-history` and `make cross-version` output, and explain the field-ID mechanism: renaming a column changes its name but not its ID, which is why files written under v1 still read correctly under v5 with no rewrite and no backfill.
 
 Two things the README must do:
 - State plainly that prices are synthetic with a planted signal, and that the results measure pipeline fidelity rather than real alpha.
-- In "What I'd do differently at production scale", write three honest paragraphs. Candidates grounded in what was actually built: the full-overwrite Silver rebuild does not survive real data volume and would need `MERGE INTO` with incremental watermarks; a SQLite catalog is single-writer and would need REST/Glue with proper commit retries; and the agent's row-count history is currently derived from snapshot count rather than a real per-snapshot metrics table, which is a shortcut a production version would replace with persisted observability data.
+- In "What I'd do differently at production scale", write three honest paragraphs. Candidates grounded in what was actually built: the full-overwrite Silver rebuild does not survive real data volume and would need `MERGE INTO` with incremental watermarks; a SQLite catalog is single-writer and would need REST/Glue with proper commit retries; and the monitors run in-process against a local warehouse rather than as an independent scheduled service with its own alerting backend, so a failure of the pipeline is also a failure of the thing meant to observe it.
 
 - [ ] **Step 6: Write `.github/workflows/ci.yml`**
 
