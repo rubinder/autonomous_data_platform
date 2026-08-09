@@ -1,5 +1,6 @@
 from datetime import date
 
+import pyarrow as pa
 import pytest
 
 from src.agent import classifier, sensors
@@ -129,6 +130,67 @@ def test_staleness_fires_end_to_end_against_real_bronze_contract(engine):
     stale_findings = [f for f in stale if f.kind == "staleness"]
     assert len(stale_findings) == 1
     assert classifier.classify(stale_findings[0])[0] == "breaking"
+
+
+def _corrupt_one_date(engine, ident, column, bad_value):
+    """Overwrite the table with one row's `column` replaced by `bad_value`.
+
+    Mutates a real committed row (rather than appending a synthetic one) so
+    the schema, including every lineage column, still conforms exactly --
+    `overwrite()` requires the same column set as the live table.
+    """
+    table = engine.scan_arrow(ident)
+    values = table.column(column).to_pylist()
+    values[0] = bad_value
+    field_index = table.schema.get_field_index(column)
+    new_column = pa.array(values, type=table.schema.field(column).type)
+    mutated = table.set_column(field_index, column, new_column)
+    engine.overwrite(ident, mutated)
+
+
+def test_observe_survives_malformed_date_sorting_above_valid_values(engine):
+    """This is the exact failure mode that crashed observe(): SQL MAX() over
+    raw strings would pick "zzzz-not-a-date" since it sorts after every real
+    "20XX-..." date, and parsing that used to raise uncaught."""
+    bronze.ingest_all(engine, n_transactions=200)
+    ident = schemas.BRONZE_TRANSACTIONS.name
+    expected_newest = sensors.observe(engine, schemas.BRONZE_TRANSACTIONS,
+                                      "transactionDate").newest_date
+    _corrupt_one_date(engine, ident, "transactionDate", "zzzz-not-a-date")
+
+    state = sensors.observe(engine, schemas.BRONZE_TRANSACTIONS, "transactionDate")
+
+    assert state.unparseable_date_count == 1
+    assert state.newest_date == expected_newest
+
+
+def test_observe_survives_malformed_date_sorting_below_valid_values(engine):
+    bronze.ingest_all(engine, n_transactions=200)
+    ident = schemas.BRONZE_TRANSACTIONS.name
+    expected_newest = sensors.observe(engine, schemas.BRONZE_TRANSACTIONS,
+                                      "transactionDate").newest_date
+    _corrupt_one_date(engine, ident, "transactionDate", "0000-00-00")
+
+    state = sensors.observe(engine, schemas.BRONZE_TRANSACTIONS, "transactionDate")
+
+    assert state.unparseable_date_count == 1
+    assert state.newest_date == expected_newest
+
+
+def test_detect_reports_unparseable_dates_as_breaking(engine):
+    bronze.ingest_all(engine, n_transactions=200)
+    ident = schemas.BRONZE_TRANSACTIONS.name
+    _corrupt_one_date(engine, ident, "transactionDate", "zzzz-not-a-date")
+    state = sensors.observe(engine, schemas.BRONZE_TRANSACTIONS, "transactionDate")
+    contract = validator.load_contract(
+        validator.CONTRACTS_DIR / "bronze_yodlee_transactions.yaml")
+
+    findings = sensors.detect(state, contract, as_of=date(2026, 6, 30), history=[])
+
+    corruption = [f for f in findings if f.kind == "data_corruption"]
+    assert len(corruption) == 1
+    assert corruption[0].evidence["unparseable_count"] == 1
+    assert classifier.classify(corruption[0])[0] == "breaking"
 
 
 def test_llm_disabled_without_api_key(monkeypatch):

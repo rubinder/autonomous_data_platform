@@ -34,6 +34,14 @@ def classify(finding: Finding) -> tuple[str, str]:
             f"Data is {finding.evidence.get('lag_days')}d behind the pipeline's "
             "logical clock; forecasts would be issued from stale features.")
 
+    if finding.kind == "data_corruption":
+        column = finding.evidence.get("column")
+        where = f" in '{column}'" if column else ""
+        return "breaking", (
+            f"{finding.evidence.get('unparseable_count')} value(s){where} do not "
+            "parse as dates. Every downstream time-based join or freshness check "
+            "on this column is unreliable until the source data is fixed.")
+
     if finding.kind == "schema_drift":
         change = finding.evidence.get("change")
         column = finding.evidence.get("column")

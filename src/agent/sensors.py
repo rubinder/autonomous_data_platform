@@ -10,12 +10,22 @@ often, and a sensor that scans the whole lake on every run is one that gets
 switched off.
 
 The one thing Iceberg metadata doesn't carry is the freshness column's
-newest *value* -- that requires reading data. `observe()` pushes that read
-through `engine.sql` as a `MAX(...)` aggregate (the same pattern
-`bronze.max_txn_date` uses), so only the aggregate result crosses back into
-Python rather than every value in the column. The engine protocol has no
-column-projected scan, so this still reads the underlying table once; the
-narrowing is in what gets materialised in Python, not in bytes read off disk.
+newest *value* -- that requires reading data, and the engine protocol has no
+column-projected scan, so `observe()` genuinely reads the whole table via
+`scan_arrow` to get it. There is no metadata-cheap path available today
+through this engine interface; a column-projected read added to
+`LakehouseEngine` would be the real fix, and is out of scope here.
+
+Because Bronze does no type coercion, that column can hold values that
+don't parse as dates. Computing "newest" with SQL `MAX()` over the raw
+strings is actively dangerous: a garbage value that happens to sort
+lexicographically above every real date (`"zzz-not-a-date"` sorts after any
+`"20XX-..."` string) becomes the `MAX()` result, and parsing it crashes the
+agent -- the worst failure mode here, since a monitor that crashes on bad
+data stops monitoring at exactly the moment something has gone wrong.
+`observe()` instead parses every value, keeps the max of only the ones that
+parse, and counts the rest as `unparseable_date_count`; `detect()` turns a
+nonzero count into its own `Finding` rather than silently dropping it.
 
 Volume is compared per snapshot, not on the table's cumulative row count.
 Bronze is append-only, so its total row count only ever grows -- comparing
@@ -40,11 +50,12 @@ class ObservedState:
     rows_in_latest_snapshot: int
     snapshot_count: int
     newest_date: date | None
+    unparseable_date_count: int = 0
 
 
 @dataclass(frozen=True)
 class Finding:
-    kind: str          # schema_drift | volume_anomaly | staleness
+    kind: str          # schema_drift | volume_anomaly | staleness | data_corruption
     table: str
     detail: str
     evidence: dict = field(default_factory=dict)
@@ -59,9 +70,15 @@ def observe(engine, table_def, date_column: str | None = None) -> ObservedState:
     summaries). `date_column`, if given, names the column to check for
     freshness; the caller (which already has the contract) is responsible
     for supplying it, keeping this function decoupled from contract parsing.
-    Its newest value is fetched with a `MAX(...)` pushed through `engine.sql`
-    rather than pulled into a Python list -- see the module docstring for why
-    that still isn't free, and what it does save.
+
+    Reading `date_column`'s newest value requires an actual scan -- see the
+    module docstring for why, and why it deliberately does *not* ask SQL for
+    `MAX(date_column)` over the raw values: Bronze does no type coercion, so
+    a non-null but unparseable value is expected input, not an edge case,
+    and letting the database sort raw strings risks handing back garbage
+    that then crashes on parse. Every value is parsed defensively instead;
+    `newest_date` is the max of the ones that parse, and the rest are
+    counted in `unparseable_date_count` for `detect()` to raise on.
     """
     ident = table_def.name
 
@@ -73,12 +90,20 @@ def observe(engine, table_def, date_column: str | None = None) -> ObservedState:
     row_count = details[-1]["total_records"] if details else 0
 
     newest = None
+    unparseable = 0
     if date_column and date_column in columns:
-        # date_column is supplied by trusted caller code (a contract's
-        # freshness expectation), never external input.
-        result = engine.sql(f"SELECT max({date_column}) AS d FROM t", tables={"t": ident})
-        if result.num_rows and result.column("d")[0].as_py() is not None:
-            newest = _to_date(result.column("d")[0].as_py())
+        arrow = engine.scan_arrow(ident)
+        if date_column in arrow.column_names:
+            parsed: list[date] = []
+            for value in arrow.column(date_column).to_pylist():
+                if value is None:
+                    continue
+                try:
+                    parsed.append(_to_date(value))
+                except (ValueError, TypeError):
+                    unparseable += 1
+            if parsed:
+                newest = max(parsed)
 
     return ObservedState(
         table=ident,
@@ -87,6 +112,7 @@ def observe(engine, table_def, date_column: str | None = None) -> ObservedState:
         rows_in_latest_snapshot=per_snapshot[-1] if per_snapshot else 0,
         snapshot_count=len(per_snapshot),
         newest_date=newest,
+        unparseable_date_count=unparseable,
     )
 
 
@@ -146,6 +172,17 @@ def detect(state: ObservedState, contract, as_of: date,
                 f"newest data is {lag}d behind AS_OF {as_of} "
                 f"(limit {freshness['max_lag_days']}d)",
                 {"lag_days": lag, "as_of": as_of.isoformat()}))
+
+    # Independent of whether a freshness expectation is declared: a date
+    # column that won't parse breaks every downstream time-based join, not
+    # just this table's own staleness check.
+    if state.unparseable_date_count > 0:
+        column = freshness["column"] if freshness else None
+        note = f" in '{column}'" if column else ""
+        findings.append(Finding(
+            "data_corruption", state.table,
+            f"{state.unparseable_date_count} value(s){note} did not parse as a date",
+            {"column": column, "unparseable_count": state.unparseable_date_count}))
 
     return findings
 
