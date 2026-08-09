@@ -96,6 +96,56 @@ def test_snapshot_row_counts_are_per_batch_not_cumulative(engine):
     assert engine.snapshot_row_counts(td.name) == [1, 2]
 
 
+def test_snapshot_details_distinguishes_append_from_overwrite(engine):
+    """Task 18's volume monitor must not read a full rebuild as a huge append."""
+    td = schemas.SILVER_MERCHANT_MAP
+    engine.create_table(td)
+    engine.append(td.name, _row("A"))
+    engine.overwrite(td.name, pa.table({
+        "merchant_normalized": ["B", "C"], "ticker": ["B", "C"],
+        "company_name": ["b", "c"], "match_type": ["exact", "exact"]}))
+    engine.append(td.name, _row("D"))
+    details = engine.snapshot_details(td.name)
+    # overwrite() commits a delete + an append; there is no "overwrite" op.
+    assert [d["operation"] for d in details] == ["append", "delete", "append", "append"]
+    assert [d["added_records"] for d in details] == [1, 0, 2, 1]
+    assert [d["is_full_rebuild"] for d in details] == [False, True, True, False]
+    assert [d["total_records"] for d in details] == [1, 0, 2, 3]
+    assert [d["snapshot_id"] for d in details] == engine.snapshots(td.name)
+    incremental = [d["added_records"] for d in details if not d["is_full_rebuild"]]
+    assert incremental == [1, 1]
+
+
+def test_append_accepts_columns_in_any_order(engine):
+    td = schemas.SILVER_MERCHANT_MAP
+    engine.create_table(td)
+    engine.append(td.name, pa.table({
+        "match_type": ["exact"], "ticker": ["SBUX"],
+        "company_name": ["Starbucks"], "merchant_normalized": ["STARBUCKS"]}))
+    out = engine.scan_arrow(td.name)
+    assert out.column("ticker")[0].as_py() == "SBUX"
+    assert out.column("merchant_normalized")[0].as_py() == "STARBUCKS"
+    assert out.column("company_name")[0].as_py() == "Starbucks"
+
+
+def test_append_rejects_missing_columns(engine):
+    td = schemas.SILVER_MERCHANT_MAP
+    engine.create_table(td)
+    with pytest.raises(KeyError, match="match_type"):
+        engine.append(td.name, pa.table({
+            "merchant_normalized": ["A"], "ticker": ["A"], "company_name": ["a"]}))
+
+
+def test_append_rejects_extra_columns(engine):
+    """A stale or typo'd column must fail, not be silently dropped."""
+    td = schemas.SILVER_MERCHANT_MAP
+    engine.create_table(td)
+    with pytest.raises(KeyError, match="tickr"):
+        engine.append(td.name, pa.table({
+            "merchant_normalized": ["A"], "ticker": ["A"], "company_name": ["a"],
+            "match_type": ["exact"], "tickr": ["A"]}))
+
+
 def test_every_table_definition_creates(engine):
     """All 12 schemas and partition specs must survive a real catalog commit."""
     for td in schemas.ALL_TABLES:

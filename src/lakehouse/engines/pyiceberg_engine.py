@@ -42,14 +42,50 @@ class PyIcebergEngine:
         return [s.snapshot_id for s in table.metadata.snapshots]
 
     def snapshot_row_counts(self, ident: str) -> list[int]:
-        """Rows added per snapshot, from metadata summaries. No data scan."""
+        """Rows added per snapshot, from metadata summaries. No data scan.
+
+        Counts `added-records` for *every* operation, including `overwrite` and
+        `replace`. A full Silver/Gold rebuild therefore reports its whole row
+        count as "added", which is not comparable with an incremental append.
+        Volume monitors that need that distinction should use
+        `snapshot_details` and filter on `operation`.
+        """
+        return [d["added_records"] for d in self.snapshot_details(ident)]
+
+    def snapshot_details(self, ident: str) -> list[dict]:
+        """Per-snapshot metadata, oldest-first. Metadata only, no data scan.
+
+        Each entry: `snapshot_id`, `parent_snapshot_id`, `operation`,
+        `added_records`, `deleted_records`, `total_records`, `is_full_rebuild`.
+
+        `is_full_rebuild` exists because `operation` alone is not enough.
+        Measured on PyIceberg 0.11.1: `Table.overwrite()` commits **two**
+        snapshots, a `delete` that clears the table followed by a plain
+        `append` -- there is no snapshot whose operation reads "overwrite".
+        So a Gold rebuild's append is, by operation, identical to an
+        incremental append, and a volume monitor comparing `added_records`
+        against a trailing median would read every rebuild as a spike.
+
+        Filter on `is_full_rebuild` to compare like with like: it is True for
+        both halves of an overwrite and False for incremental appends.
+        """
         table = self.catalog.load_table(ident)
-        counts = []
+        raw = []
         for snapshot in table.metadata.snapshots:
             summary = getattr(snapshot, "summary", None) or {}
-            added = summary.get("added-records") or summary.get("added_records") or 0
-            counts.append(int(added))
-        return counts
+            operation = getattr(summary, "operation", None)
+            raw.append({
+                "snapshot_id": snapshot.snapshot_id,
+                "parent_snapshot_id": snapshot.parent_snapshot_id,
+                "operation": getattr(operation, "value", operation),
+                "added_records": _summary_int(summary, "added-records"),
+                "deleted_records": _summary_int(summary, "deleted-records"),
+                "total_records": _summary_int(summary, "total-records"),
+            })
+        by_id = {d["snapshot_id"]: d for d in raw}
+        for detail in raw:
+            detail["is_full_rebuild"] = _is_full_rebuild(detail, by_id)
+        return raw
 
     def schema_history(self, ident: str) -> list[dict]:
         """One entry per schema version this table has had."""
@@ -74,15 +110,51 @@ class PyIcebergEngine:
             con.close()
 
 
-def _conform(data: pa.Table, target: pa.Schema) -> pa.Table:
-    """Reorder `data`'s columns to the table schema, then cast.
+def _clears_table(detail: dict | None) -> bool:
+    """A delete that removed rows and left the table empty."""
+    return bool(
+        detail
+        and detail["operation"] == "delete"
+        and detail["deleted_records"] > 0
+        and detail["total_records"] == 0
+    )
 
-    `pa.Table.cast` is positional: it silently depends on the caller building
-    columns in schema order. Selecting by name first makes a column-order
-    mistake in a downstream job a loud KeyError instead of a type error or,
-    worse, two same-typed columns swapping values.
+
+def _is_full_rebuild(detail: dict, by_id: dict) -> bool:
+    """Both halves of the delete+append pair that `Table.overwrite()` commits."""
+    if detail["operation"] in ("overwrite", "replace"):
+        return True
+    if _clears_table(detail):
+        return True
+    if detail["operation"] == "append":
+        return _clears_table(by_id.get(detail["parent_snapshot_id"]))
+    return False
+
+
+def _summary_int(summary, key: str) -> int:
+    """Read a numeric key from a snapshot summary. Iceberg stores them as str."""
+    raw = summary.get(key) or summary.get(key.replace("-", "_")) or 0
+    return int(raw)
+
+
+def _conform(data: pa.Table, target: pa.Schema) -> pa.Table:
+    """Match `data`'s columns to the table schema by name, then cast.
+
+    `pa.Table.cast` compares names positionally and rejects any mismatch --
+    `ValueError: Target schema's field names are not matching the table's
+    field names` -- so it refuses a correct-but-differently-ordered table.
+    This is purely a loosening of that: callers may build columns in any
+    order and we reorder by name.
+
+    The loosening is deliberately one-way. Column *sets* still have to match
+    exactly, because `select()` would otherwise drop an unexpected column
+    silently -- a stale or typo'd name in a downstream writer would vanish
+    instead of failing. Missing and extra columns both raise.
     """
     missing = [name for name in target.names if name not in data.column_names]
-    if missing:
-        raise KeyError(f"missing columns for target schema: {missing}")
+    extra = [name for name in data.column_names if name not in target.names]
+    if missing or extra:
+        raise KeyError(
+            f"column set does not match target schema: missing={missing}, extra={extra}"
+        )
     return data.select(list(target.names)).cast(target)
