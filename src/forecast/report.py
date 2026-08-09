@@ -41,20 +41,25 @@ def build_report(preds: pd.DataFrame, training: pd.DataFrame | None = None) -> s
     ]
 
     for ticker, grp in preds.groupby("ticker"):
+        n = int(grp["y_true"].notna().sum())
         m = backtest.metrics(grp, "y_pred_model")
         p = backtest.metrics(grp, "y_pred_persistence")
         a = backtest.metrics(grp, "y_pred_arima")
         lines.append(
             f"| {ticker} | {m['rmse']:.5f} | {p['rmse']:.5f} | {a['rmse']:.5f} | "
             f"{m['directional_accuracy']:.3f} | {m['ic']:.3f} | "
-            f"**{backtest.verdict(m, p)}** | **{backtest.verdict(m, a)}** |")
+            f"**{backtest.verdict(m, p, n)}** | **{backtest.verdict(m, a, n)}** |")
 
     sharpe = backtest.long_short_sharpe(preds, "y_pred_model")
     sharpe_text = (f"{sharpe:.2f}" if not np.isnan(sharpe)
                    else "n/a (insufficient trading days)")
-    beats = sum(1 for _, g in preds.groupby("ticker")
-                if backtest.verdict(backtest.metrics(g, "y_pred_model"),
-                                    backtest.metrics(g, "y_pred_persistence")) == "beats")
+
+    def _beats_persistence(g: pd.DataFrame) -> bool:
+        n = int(g["y_true"].notna().sum())
+        return backtest.verdict(backtest.metrics(g, "y_pred_model"),
+                                 backtest.metrics(g, "y_pred_persistence"), n) == "beats"
+
+    beats = sum(1 for _, g in preds.groupby("ticker") if _beats_persistence(g))
     total = preds["ticker"].nunique()
 
     lines += [
@@ -79,14 +84,23 @@ def build_report(preds: pd.DataFrame, training: pd.DataFrame | None = None) -> s
             "With planted signal at differing lags and betas, uniform wins suggest "
             "leakage. Re-check `tests/test_no_leakage.py` before trusting this.")
     else:
-        losers = [t for t, g in preds.groupby("ticker")
-                  if backtest.verdict(backtest.metrics(g, "y_pred_model"),
-                                      backtest.metrics(g, "y_pred_persistence")) != "beats"]
+        losers = [t for t, g in preds.groupby("ticker") if not _beats_persistence(g)]
         if losers:
+            # Deliberately no lag/beta narrative here: measured against this
+            # run's results, ticker ranking by IC does not track planted lag
+            # or beta (e.g. CMG has the shortest lag and highest beta but is
+            # not the best performer) -- inventing a causal story the data
+            # doesn't support is exactly the overclaiming this report exists
+            # to avoid. State only what was measured.
+            loser_ics = [backtest.metrics(preds[preds["ticker"] == t],
+                                           "y_pred_model")["ic"] for t in losers]
             lines.append(
                 f"Tickers where the model does **not** beat persistence: "
-                f"{', '.join(losers)}. Longer planted lags and lower betas are harder "
-                "to recover from noisy daily spend, which is the expected outcome.")
+                f"{', '.join(losers)}. Measured IC on these tickers ranges from "
+                f"{min(loser_ics):.3f} to {max(loser_ics):.3f} -- consistent with the "
+                "modest planted signal this dataset carries overall (Task 10: max "
+                "|feature-target correlation| 0.156), not with any pattern by "
+                "planted lag or beta.")
 
     if training is not None and len(training):
         spend_cols = list(features.SPEND_FEATURES)

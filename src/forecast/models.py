@@ -46,9 +46,27 @@ def fit_predict_ticker(df: pd.DataFrame, n_folds: int = 5) -> pd.DataFrame:
 
     frames = []
     for fold in folds:
+        # Regularised hard, deliberately: at ~380 training rows, 14 features,
+        # and a measured max |feature-target correlation| of 0.156 (Task 10),
+        # the earlier config (max_iter=200, learning_rate=0.05,
+        # l2_regularization=1.0, min_samples_leaf=20) overfit -- predictions
+        # came out at roughly half the target's amplitude with near-zero
+        # correlation to it (std(y_pred) ~0.02-0.03 vs std(y_true) ~0.03-0.06,
+        # some tickers with a visible mean bias), which is textbook
+        # overfitting on noise, not a real fit. early_stopping carves its
+        # validation split from the training block only (fold.train is
+        # already strictly before fold.test under the purge gap, so this
+        # cannot see the test block), stops iterating once validation loss
+        # stalls, and the higher l2/min_samples_leaf further discourage
+        # memorizing individual rows. Measured effect: mean RMSE ratio to
+        # persistence across the six real tickers dropped from ~1.16 to
+        # ~1.02 -- see docs/forecast-report.md and the Task 13 review fix
+        # report for before/after numbers.
         model = HistGradientBoostingRegressor(
-            max_depth=3, max_iter=200, learning_rate=0.05,
-            l2_regularization=1.0, min_samples_leaf=20,
+            max_depth=3, max_iter=300, learning_rate=0.03,
+            l2_regularization=5.0, min_samples_leaf=40,
+            early_stopping=True, validation_fraction=0.2,
+            n_iter_no_change=15, tol=1e-4,
             random_state=config.SEED,
         )
         model.fit(x[fold.train], y[fold.train])

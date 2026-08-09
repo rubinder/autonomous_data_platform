@@ -40,6 +40,18 @@ def test_directional_accuracy_ignores_zero_predictions():
     assert np.isnan(m["directional_accuracy"])
 
 
+def test_directional_accuracy_ignores_any_constant_predictor():
+    """A constant *nonzero* predictor (e.g. ARIMA's training-mean fallback)
+    carries the same zero directional information as an all-zero one -- it
+    always points the same way, so its "accuracy" is just the base rate of
+    up days, not skill.
+    """
+    f = _frame()
+    f["y_pred_constant"] = 0.0123
+    m = backtest.metrics(f, "y_pred_constant")
+    assert np.isnan(m["directional_accuracy"])
+
+
 def test_sharpe_positive_for_informative_predictions():
     frames = []
     for i, ticker in enumerate("ABCDEF"):
@@ -55,6 +67,31 @@ def test_verdict_requires_a_margin_not_just_a_smaller_number():
     tie = {"rmse": 0.0199, "ic": 0.01, "directional_accuracy": 0.50, "mae": 0.01}
     win = {"rmse": 0.0150, "ic": 0.20, "directional_accuracy": 0.58, "mae": 0.01}
     loss = {"rmse": 0.0300, "ic": -0.05, "directional_accuracy": 0.47, "mae": 0.02}
-    assert backtest.verdict(tie, base) == "inconclusive"
-    assert backtest.verdict(win, base) == "beats"
-    assert backtest.verdict(loss, base) == "loses"
+    # n=600 at the default 5-day horizon -> n_eff=120, comfortably enough to
+    # make win's IC=0.20 statistically significant (t ~ 2.2).
+    assert backtest.verdict(tie, base, n=600) == "inconclusive"
+    assert backtest.verdict(win, base, n=600) == "beats"
+    assert backtest.verdict(loss, base, n=600) == "loses"
+
+
+def test_verdict_requires_statistical_significance_not_just_margin():
+    """The same IC that wins with plenty of data is noise with too little."""
+    base = {"rmse": 0.0200, "ic": 0.00, "directional_accuracy": 0.50, "mae": 0.01}
+    win = {"rmse": 0.0150, "ic": 0.20, "directional_accuracy": 0.58, "mae": 0.01}
+    assert backtest.verdict(win, base, n=40) == "inconclusive"
+
+
+def test_verdict_does_not_beat_a_worse_baseline_with_negative_ic():
+    """A model with negative IC cannot 'beat' merely because the baseline
+    (e.g. a diverging ARIMA fit) is even more negative -- see Task 13 review
+    finding 4 (ULTA model IC -0.007 vs ARIMA IC -0.118).
+    """
+    broken_baseline = {"rmse": 0.0800, "ic": -0.30, "directional_accuracy": 0.40, "mae": 0.05}
+    weak_model = {"rmse": 0.0600, "ic": -0.02, "directional_accuracy": 0.48, "mae": 0.04}
+    assert backtest.verdict(weak_model, broken_baseline, n=600) != "beats"
+
+
+def test_verdict_handles_zero_baseline_rmse_without_crashing():
+    perfect_baseline = {"rmse": 0.0, "ic": 0.5, "directional_accuracy": 1.0, "mae": 0.0}
+    imperfect_model = {"rmse": 0.01, "ic": 0.3, "directional_accuracy": 0.7, "mae": 0.01}
+    assert backtest.verdict(imperfect_model, perfect_baseline, n=600) == "loses"
