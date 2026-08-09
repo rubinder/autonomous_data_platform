@@ -1,0 +1,35 @@
+name: monitors
+
+# Runs the operational loop -- build, row-level monitors, arrival SLAs, and
+# the dry-run ops agent -- on a schedule. This is the check that fires when
+# every row-level quality check is silent because nothing new landed: an
+# empty delta has no nulls, no duplicates, and nothing out of range.
+#
+# Every step below gates on a genuine failure (a breach or a crash), never
+# on which forecast model won. At smoke scale (N_TRANSACTIONS=5000 here,
+# for a fast scheduled run) roughly 59% of training rows have every spend
+# feature NULL, so model skill is not a meaningful signal at this scale --
+# see docs/forecast-report.md's small-sample caveat. `make forecast`
+# already only fails when the pipeline produced no predictions at all, not
+# on model comparison, and the same rule holds here: this workflow must
+# never fail because the model "didn't win".
+on:
+  schedule:
+    - cron: "0 */6 * * *"    # every six hours
+  workflow_dispatch:
+
+jobs:
+  run-monitors:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync
+      - name: Build the lakehouse
+        run: N_TRANSACTIONS=20000 uv run make all
+      - name: Data quality monitors
+        run: uv run make monitor
+      - name: Data arrival SLAs
+        run: uv run make arrival
+      - name: Ops agent (dry-run)
+        run: uv run make agent

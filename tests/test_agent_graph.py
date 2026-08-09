@@ -1,5 +1,6 @@
 from datetime import date
 
+import duckdb
 import pytest
 
 from src.agent import actions, graph
@@ -90,7 +91,22 @@ class _FakeEngine:
         return [{"schema_id": 0, "columns": self._columns, "field_ids": {}}]
 
     def table_exists(self, ident):
-        return True
+        # Only the one table this fake actually models: Task 19's monitor
+        # node calls `runner.run_monitors` / `arrival.check_arrival` for
+        # Silver, Gold and `ops.*` tables too, and those must read as
+        # "not built yet" here rather than as an existing table whose data
+        # happens not to match -- `scan_arrow` below only ever returns
+        # Bronze-transaction-shaped columns.
+        return ident == "bronze.yodlee_transactions_raw"
+
+    def sql(self, query, tables):
+        con = duckdb.connect()
+        try:
+            for alias, ident in tables.items():
+                con.register(alias, self.scan_arrow(ident))
+            return con.execute(query).to_arrow_table()
+        finally:
+            con.close()
 
 
 def test_graph_runs_offline_and_returns_state(monkeypatch):

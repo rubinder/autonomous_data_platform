@@ -291,12 +291,26 @@ OPS_MONITOR_RESULTS = TableDef(
     PartitionSpec(PartitionField(1, 1000, MonthTransform(), "run_at_month")),
 )
 
+OPS_ALERT_LOG = TableDef(
+    "ops.alert_log",
+    Schema(
+        NestedField(1, "run_at", DateType(), required=True),
+        NestedField(2, "alert_key", StringType(), required=True),
+        NestedField(3, "severity", StringType(), required=True),
+        NestedField(4, "title", StringType(), required=False),
+        NestedField(5, "body", StringType(), required=False),
+        NestedField(6, "source", StringType(), required=False),
+        NestedField(7, "delivered", BooleanType(), required=False),
+    ),
+    PartitionSpec(PartitionField(1, 1000, MonthTransform(), "run_at_month")),
+)
+
 ALL_TABLES: tuple[TableDef, ...] = (
     BRONZE_TRANSACTIONS, BRONZE_ACCOUNTS, BRONZE_PRICES,
     SILVER_TRANSACTIONS, SILVER_QUARANTINE, SILVER_ACCOUNTS,
     SILVER_MERCHANT_MAP, SILVER_PRICES,
     GOLD_SPEND, GOLD_STOCK_FEATURES, GOLD_TRAINING, GOLD_PREDICTIONS,
-    OPS_MONITOR_RESULTS,
+    OPS_MONITOR_RESULTS, OPS_ALERT_LOG,
 )
 
 

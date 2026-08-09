@@ -1,4 +1,4 @@
-.PHONY: all bronze silver gold forecast agent monitor test lint clean timetravel drift-demo schema-history cross-version maintenance
+.PHONY: all bronze silver gold forecast agent monitor arrival test lint clean timetravel drift-demo schema-history cross-version maintenance
 UV := uv run
 
 all: bronze silver gold forecast
@@ -9,6 +9,7 @@ gold:        ; $(UV) python -m src.lakehouse.gold
 forecast:    ; $(UV) python -m src.forecast.report
 agent:       ; $(UV) python -m src.agent.graph
 monitor:     ; $(UV) python -m src.ops.runner
+arrival:     ; $(UV) python -m src.ops.arrival
 timetravel:  ; $(UV) python -m src.lakehouse.maintenance timetravel
 drift-demo:  ; $(UV) python -m src.lakehouse.maintenance drift-demo
 schema-history: ; $(UV) python -m src.lakehouse.maintenance schema-history

@@ -23,6 +23,13 @@ _WIDENING = {("int", "long"), ("int32", "int64"), ("float", "double")}
 
 
 def classify(finding: Finding) -> tuple[str, str]:
+    if finding.kind == "monitor_breach":
+        monitor = finding.evidence.get("monitor")
+        return "breaking", (
+            f"Monitor '{monitor}' breached on {finding.table}: {finding.detail} "
+            "A monitor breach is, by definition, already a judged verdict -- "
+            "there is no additive reading of a check that has already failed.")
+
     if finding.kind == "volume_anomaly":
         return "breaking", (
             f"Latest batch added {finding.evidence.get('rows_in_latest_snapshot'):,} "

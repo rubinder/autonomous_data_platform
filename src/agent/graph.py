@@ -17,6 +17,7 @@ from src import config
 from src.agent import actions, classifier, sensors
 from src.contracts import validator
 from src.lakehouse import schemas
+from src.ops import arrival, runner
 
 # (table_def, contract file under CONTRACTS_DIR, freshness column to observe)
 WATCHED = (
@@ -45,6 +46,44 @@ def sense_and_detect(state: AgentState) -> AgentState:
         per_snapshot = engine.snapshot_row_counts(table_def.name)
         history = per_snapshot[:-1] or per_snapshot
         findings += sensors.detect(observed, contract, state["as_of"], history)
+    return {**state, "findings": findings}
+
+
+def run_monitors(state: AgentState) -> AgentState:
+    """Row-level monitors plus arrival SLAs, folded into `state["findings"]`.
+
+    Only `breach` results become findings -- `warn` is real signal for the
+    alert channel (see `src.ops.alerts`) but is not, on its own, grounds for
+    the agent to file an incident or a GitHub issue.
+
+    Arrival SLAs are skipped for a table that does not exist yet rather than
+    reported as an `arrival_missing` breach: the agent can run against a
+    lakehouse mid-build (Silver/Gold not produced yet), and that is not the
+    same condition as a Silver/Gold table that existed and then stopped
+    receiving data. `src.ops.arrival`'s own CLI (`make arrival`, run only
+    after `make all`) is where a genuinely missing table is treated as a
+    breach.
+    """
+    engine = state["engine"]
+    as_of = state["as_of"]
+    findings = list(state["findings"])
+
+    results = runner.run_monitors(engine, as_of)
+    for sla in arrival.ARRIVAL_SLAS:
+        if engine.table_exists(sla.table):
+            results += arrival.check_arrival(engine, sla, as_of)
+
+    for result in results:
+        if result.status != "breach":
+            continue
+        findings.append(sensors.Finding(
+            kind="monitor_breach", table=result.table,
+            detail=f"[{result.monitor}] {result.detail}",
+            evidence={
+                "monitor": result.monitor, "kind": result.kind,
+                "column": result.column, "metric": result.metric,
+                "baseline": result.baseline, "status": result.status,
+            }))
     return {**state, "findings": findings}
 
 
@@ -77,10 +116,12 @@ def _should_act(state: AgentState) -> str:
 def build_graph():
     builder = StateGraph(AgentState)
     builder.add_node("sense", sense_and_detect)
+    builder.add_node("monitor", run_monitors)
     builder.add_node("classify", classify_findings)
     builder.add_node("act", act)
     builder.set_entry_point("sense")
-    builder.add_edge("sense", "classify")
+    builder.add_edge("sense", "monitor")
+    builder.add_edge("monitor", "classify")
     builder.add_conditional_edges("classify", _should_act, {"act": "act", "end": END})
     builder.add_edge("act", END)
     return builder.compile()
