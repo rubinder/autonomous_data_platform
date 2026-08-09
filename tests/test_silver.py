@@ -1,5 +1,6 @@
 from datetime import date
 
+import pyarrow as pa
 import pytest
 
 from src.lakehouse import bronze, schemas, silver
@@ -12,6 +13,52 @@ def engine(tmp_path):
     eng = PyIcebergEngine(catalog_mod.get_catalog(tmp_path / "wh"))
     bronze.ingest_all(eng, n_transactions=20000)
     return eng
+
+
+def _txn_record(txn_id: int, last_updated: str, amount: float,
+                 base_type: str = "DEBIT", currency: str = "USD",
+                 txn_date: str = "2024-06-01", post_date: str = "2024-06-02") -> dict:
+    """A minimal but schema-complete Bronze transaction record, hand-built so
+    tests can control `id`/`lastUpdated`/`amount`/`currency` directly instead
+    of relying on the generator's deterministic (and therefore duplicate-free
+    across the fields that matter) output."""
+    return {
+        "id": txn_id,
+        "accountId": 100_000,
+        "date": txn_date,
+        "transactionDate": txn_date,
+        "postDate": post_date,
+        "amount": {"amount": amount, "currency": currency},
+        "runningBalance": {"amount": 1000.0, "currency": currency},
+        "merchant": {
+            "id": "M1",
+            "source": "TEST MERCHANT",
+            "categoryLabel": "Test",
+            "address": {"city": "SEATTLE", "state": "WA", "country": "USA"},
+        },
+        "status": "POSTED",
+        "baseType": base_type,
+        "subType": "PAYMENT" if base_type == "DEBIT" else "CREDIT",
+        "category": "Other Expenses",
+        "categoryType": "EXPENSE" if base_type == "DEBIT" else "INCOME",
+        "categoryId": 40,
+        "detailCategoryId": 4000,
+        "detailCategory": "Uncategorized",
+        "highLevelCategoryId": 30,
+        "categorySource": "SYSTEM",
+        "sourceType": "AGGREGATED",
+        "checkNumber": "",
+        "isManual": False,
+        "container": None,
+        "createdDate": last_updated,
+        "lastUpdated": last_updated,
+    }
+
+
+def _append_synthetic_txns(engine, records: list[dict]) -> None:
+    enriched = bronze.add_lineage(records, "synthetic_test.json")
+    table = pa.Table.from_pylist(enriched, schema=schemas.BRONZE_TRANSACTIONS.schema.as_arrow())
+    engine.append(schemas.BRONZE_TRANSACTIONS.name, table)
 
 
 @pytest.mark.parametrize("raw,expected", [
@@ -89,3 +136,49 @@ def test_contract_violation_aborts_the_build(engine, monkeypatch):
     monkeypatch.setattr(silver, "_SIGN_DEBITS", False)  # inject the classic bug
     with pytest.raises(Exception):  # noqa: B017 -- any failure must abort; type isn't the point
         silver.build_all(engine)
+
+
+def test_dedup_tie_break_prefers_greater_last_updated(engine):
+    """The generator's re-ingest duplicates are byte-identical, so
+    `test_dedup_keeps_latest_last_updated` collapsing them proves nothing
+    about which row the ORDER BY tie-break actually keeps. This test injects
+    a same-id pair that differs in BOTH `lastUpdated` and `amount`, so only
+    the correct tie-break produces the expected surviving amount."""
+    txn_id = 999_999_001
+    older = _txn_record(txn_id, "2020-01-01T00:00:00+00:00", 111.11)
+    newer = _txn_record(txn_id, "2030-01-01T00:00:00+00:00", 222.22)
+    _append_synthetic_txns(engine, [older, newer])
+
+    silver.build_all(engine)
+
+    out = engine.sql(
+        f"SELECT signed_amount FROM s WHERE id = {txn_id}",
+        tables={"s": schemas.SILVER_TRANSACTIONS.name})
+    rows = out.to_pylist()
+    assert len(rows) == 1
+    # DEBIT signs negative; 2030 lastUpdated (222.22) must win over 2020 (111.11).
+    assert rows[0]["signed_amount"] == pytest.approx(-222.22)
+
+
+def test_synthetic_non_usd_row_is_quarantined_with_reason_and_currency(engine):
+    """The generator emits USD only, so the quarantine path has never run
+    against a real reject before. Inject one EUR row and assert it is
+    excluded from silver.transactions and lands in quarantine with the
+    expected reason and its original currency preserved."""
+    txn_id = 999_999_002
+    eur_row = _txn_record(txn_id, "2024-06-01T00:00:00+00:00", 50.0, currency="EUR")
+    _append_synthetic_txns(engine, [eur_row])
+
+    silver.build_all(engine)
+
+    kept = engine.sql(
+        f"SELECT * FROM s WHERE id = {txn_id}",
+        tables={"s": schemas.SILVER_TRANSACTIONS.name})
+    assert kept.num_rows == 0
+
+    quarantined = engine.sql(
+        f"SELECT currency, quarantine_reason FROM q WHERE id = {txn_id}",
+        tables={"q": schemas.SILVER_QUARANTINE.name}).to_pylist()
+    assert len(quarantined) == 1
+    assert quarantined[0]["currency"] == "EUR"
+    assert quarantined[0]["quarantine_reason"] == "non_usd_currency"
