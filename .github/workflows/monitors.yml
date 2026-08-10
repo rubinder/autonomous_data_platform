@@ -19,7 +19,7 @@ name: monitors
 # never fail because the model "didn't win".
 on:
   schedule:
-    - cron: "0 */6 * * *"    # every six hours
+    - cron: "0 6 * * 1"      # weekly, Mondays at 06:00 UTC
   workflow_dispatch:
 
 jobs:

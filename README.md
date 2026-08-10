@@ -635,7 +635,7 @@ Two workflows, and **neither gates on any model-skill metric**.
 **`.github/workflows/ci.yml`** (push / PR): ruff, the full test suite, a
 reduced-scale `make all` smoke, and an ops-agent dry run on the pure-Python path.
 
-**`.github/workflows/monitors.yml`** (every 6 hours): builds the lakehouse and
+**`.github/workflows/monitors.yml`** (weekly, Mondays 06:00 UTC): builds the lakehouse and
 runs the monitors, the arrival SLAs, and the agent — the scheduled operational
 loop, which is the check that fires when every row-level check is silent because
 nothing landed.

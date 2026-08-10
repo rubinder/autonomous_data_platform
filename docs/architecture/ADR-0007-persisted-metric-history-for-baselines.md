@@ -27,7 +27,7 @@ genuine shift. Measured on a baseline of twenty ~100 values plus one outlier at
 robust z = 20.2 (caught)**.
 
 **What stops an alert storm?** A breach that persists across scheduled runs
-re-fires every run, and a channel that pages every six hours about the same
+re-fires every run, and a channel that pages on every scheduled run about the same
 condition gets muted.
 
 ## Decision
