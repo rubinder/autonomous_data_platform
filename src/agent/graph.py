@@ -7,10 +7,12 @@ into a real `gh` call.
 """
 from __future__ import annotations
 
+import json
 import sys
 from datetime import date
 from typing import Any, TypedDict
 
+import pyarrow as pa
 from langgraph.graph import END, StateGraph
 
 from src import config
@@ -104,6 +106,52 @@ def classify_findings(state: AgentState) -> AgentState:
     return {**state, "classified": classified}
 
 
+def persist_findings(state: AgentState) -> AgentState:
+    """Append this run to `ops.finding_log` and `ops.agent_runs`.
+
+    Runs on every path, including the one where nothing was found -- that is
+    the whole reason `ops.agent_runs` exists. `docs/incidents/*.md` records the
+    latest state of each open finding and overwrites itself; this records
+    history, which is what `make report` diffs day over day.
+    """
+    engine = state["engine"]
+    as_of = state["as_of"]
+    classified = state["classified"]
+    actioned = {id(c["finding"]) for c in classified if c["severity"] in ACTIONABLE}
+
+    engine.create_table(schemas.OPS_AGENT_RUNS)
+    engine.append(schemas.OPS_AGENT_RUNS.name, pa.Table.from_pylist([{
+        "run_at": as_of,
+        "findings_count": len(classified),
+        "actioned_count": len(actioned),
+        "dry_run": state["dry_run"],
+    }], schema=schemas.OPS_AGENT_RUNS.schema.as_arrow()))
+
+    if classified:
+        engine.create_table(schemas.OPS_FINDING_LOG)
+        engine.append(schemas.OPS_FINDING_LOG.name, pa.Table.from_pylist([{
+            "run_at": as_of,
+            "finding_key": sensors.finding_key(c["finding"]),
+            "table_name": c["finding"].table,
+            "kind": c["finding"].kind,
+            "severity": c["severity"],
+            "column_name": (c["finding"].evidence.get("column")
+                            or c["finding"].evidence.get("monitor")),
+            "detail": c["finding"].detail,
+            "reasoning": c["reasoning"],
+            # Stored as JSON text rather than a typed struct: evidence keys
+            # differ per finding kind, and a schema that has to grow a column
+            # every time a new check is added is a schema that will lag the
+            # checks. The report renders it, it is never joined on.
+            "evidence": json.dumps(c["finding"].evidence, default=str,
+                                   sort_keys=True),
+            "actioned": id(c["finding"]) in actioned,
+        } for c in classified],
+            schema=schemas.OPS_FINDING_LOG.schema.as_arrow()))
+
+    return state
+
+
 def act(state: AgentState) -> AgentState:
     taken: list[str] = []
     for item in state["classified"]:
@@ -127,11 +175,16 @@ def build_graph():
     builder.add_node("sense", sense_and_detect)
     builder.add_node("monitor", run_monitors)
     builder.add_node("classify", classify_findings)
+    builder.add_node("persist", persist_findings)
     builder.add_node("act", act)
     builder.set_entry_point("sense")
     builder.add_edge("sense", "monitor")
     builder.add_edge("monitor", "classify")
-    builder.add_conditional_edges("classify", _should_act, {"act": "act", "end": END})
+    # Persist sits between classify and act, on every path -- a run that found
+    # nothing still has to be recorded, or the report cannot distinguish "clean"
+    # from "never ran".
+    builder.add_edge("classify", "persist")
+    builder.add_conditional_edges("persist", _should_act, {"act": "act", "end": END})
     builder.add_edge("act", END)
     return builder.compile()
 

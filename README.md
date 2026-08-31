@@ -47,6 +47,10 @@ A complete data platform, built end to end, small enough to read:
 - **17 data-quality monitors + 8 arrival checks** with persisted metric history
   and robust (median/MAD) baselines. 10 of the 17 are declared in YAML; the
   other 7 are column-type checks generated per contract field.
+- **A daily report that tells the story** — `make report` assembles verdict,
+  schema evolution, data quality, anomalies, errors and a **day-over-day diff**
+  from `ops.*`. It reads; it never recomputes. A three-day sample sequence is in
+  [`reports/`](reports/).
 - **The AI-SDLC record** — the spec, the plan, every task brief, every review
   diff, and a ledger of what was found and changed. See
   [`docs/ai-sdlc/`](docs/ai-sdlc/workflow.md).
@@ -170,12 +174,13 @@ uv run make lint           # ruff
 |---|---|
 | `make all` | `bronze silver gold forecast` end to end, offline, deterministic |
 | `make monitor` | 17 data-quality checks; persists metrics to `ops.monitor_results` and routes alerts to `ops.alert_log` (**dry-run** unless `--execute`) |
+| `make report` | the daily platform report for `AS_OF_DATE`, assembled from `ops.*` and written to `reports/daily-<date>.md` |
 | `make arrival` | 8 checks across 3 arrival SLAs, on the NYSE trading calendar |
 | `make agent` | the LangGraph ops agent (**dry-run** unless `--execute`) |
 | `make schema-history` | every schema version with field ids |
 | `make cross-version` | one query spanning snapshots written under different schemas |
 | `make timetravel` | read at snapshot N−1 vs N |
-| `make drift-demo` | evolve the schema and inject a volume collapse |
+| `make drift-demo` | evolve the schema and inject a volume collapse (`--day N` applies one scheduled change at a time) |
 | `make maintenance` | expire old snapshots |
 | `make smoke` | `make all` at `N_TRANSACTIONS=5000` |
 
@@ -436,8 +441,8 @@ live behaviour on the strength of its unit tests. It runs now.
 A LangGraph state machine (`src/agent/graph.py`):
 
 ```
-sense ──▶ monitor ──▶ classify ──┬──▶ act ──▶ END
-                                 └──▶ END (no action)
+sense ──▶ monitor ──▶ classify ──▶ persist ──┬──▶ act ──▶ END
+                                             └──▶ END (no action)
 ```
 
 | Node | What it does |
@@ -445,6 +450,7 @@ sense ──▶ monitor ──▶ classify ──┬──▶ act ──▶ END
 | `sense` | Reads Iceberg **metadata** — schema history, snapshot log, per-snapshot added-records, newest date. No data scan where metadata suffices. |
 | `monitor` | Runs the `src/ops` monitors and arrival SLAs; converts breaches into findings. |
 | `classify` | Severity per finding: `breaking` / `renaming` / `widening` / `additive` / `enum_drift` / `benign`. **Rules first**; the optional Claude call handles only unmatched cases. |
+| `persist` | Appends this run to `ops.finding_log` and `ops.agent_runs`. Runs on **every** path, including the clean one. |
 | `act` | Writes `docs/incidents/<slug>.md` and would file a GitHub issue. **Dry-run by default.** |
 
 **Classification is rules-first because CI must never depend on a model call**
@@ -547,6 +553,104 @@ real Iceberg table; type *narrowing* is covered by unit test only, because
 PyIceberg will not narrow a column type and faking that state would misrepresent
 what the storage layer does
 ([decisions/0005](docs/ai-sdlc/decisions/0005-drift-scenario-coverage-split.md)).
+
+## The daily report
+
+Everything above measures. `make report` is the thing that *reads it back*.
+
+The platform was already accumulating a narrative and then throwing it away.
+`ops.monitor_results` has carried `run_at` since Task 18 and nothing ever queried
+it. `docs/incidents/*.md` records the latest state of each open finding — and
+because the incident slug is deliberately stable so a recurring finding rewrites
+one file instead of spawning many, **every write destroyed the previous state**.
+Nothing in the repository could answer "when did this start?" or "did yesterday's
+problem go away?"
+
+Two append-only tables fix that. `ops.finding_log` records every finding on every
+run, keyed on `sensors.finding_key`. `ops.agent_runs` records the run itself —
+because a clean run writes no finding rows, so without it "the agent ran and
+found nothing" and "the agent never ran" are the same empty table, and only one
+of those is good news.
+
+```bash
+uv run make report                       # today
+AS_OF_DATE=2026-06-29 uv run make report # any recorded day
+```
+
+### A four-day sequence
+
+`drift-demo --day N` applies one scheduled schema change instead of all four, so
+the agent can run between them and the log accumulates a real timeline. The four
+files in [`reports/`](reports/) are this sequence, verbatim, from one continuous
+warehouse history:
+
+```bash
+AS_OF_DATE=2026-06-28 make monitor agent report   # clean:  0 findings
+uv run python -m src.lakehouse.maintenance drift-demo --day 1   # +merchantCategoryCode
+AS_OF_DATE=2026-06-29 make monitor agent report   #         1 finding
+uv run python -m src.lakehouse.maintenance drift-demo --day 4   # checkNumber -> check_reference
+AS_OF_DATE=2026-06-30 make monitor agent report   #         2 findings
+uv run python -m src.lakehouse.maintenance drift-demo           # the rest + a volume collapse
+AS_OF_DATE=2026-07-01 make monitor agent report   #         8 findings
+```
+
+Day three's diff section — the sentence the platform previously could not
+produce at all:
+
+```markdown
+Compared with `2026-06-29`: **1 new**, **0 cleared**, **1 still open**.
+
+### New
+- `[renaming]` column 'checkNumber' was renamed to 'check_reference' (field id 20)
+
+### Still open
+- `[additive]` column 'merchantCategoryCode' present in table but not declared
+  in contract (open 1d (since 2026-06-29))
+```
+
+Not "there is a finding", but *this one is new, this one has been open since
+Monday, and nothing was resolved.*
+
+Day four is where every section fills in at once: two schema changes still open,
+a volume collapse, the `bronze_txn_row_count` monitor breaching against its now
+250,000-row baseline, and three arrival-SLA gaps.
+
+**Why day four fires arrival SLAs, stated plainly:** the dataset ends
+`2026-06-30`, so running the fourth day at `2026-07-01` is deliberately one day
+past the end of the data. That is what makes `silver.transactions`,
+`silver.stock_prices` and `gold.forecast_training_set` report a missing period —
+the same mechanism the `AS_OF_DATE=2026-07-31 make arrival` example uses. It is a
+real breach of a real SLA against a logical clock, not a contrivance, but the
+sequence that produced it is stated with it.
+
+### The report reads; it does not measure
+
+`build_report()` takes a `ReportSnapshot` dataclass and returns a string. It is
+handed no engine, so it **cannot** compute a metric even by accident — which is
+what makes the claim testable rather than a comment. `load_snapshot()` is the
+only function in the module that touches a warehouse.
+
+The reason is not tidiness. A report that recomputes a number can disagree with
+the monitor that raised the alert, and when those two disagree, the report is the
+one people believe.
+
+### Absences are reported as absences
+
+Three of them, each a place where a naive report would print something reassuring:
+
+| Situation | What a naive report shows | What this one shows |
+|---|---|---|
+| No agent run for the date | empty findings table → looks clean | `Verdict — NO RUN RECORDED`, "this is **not** a clean bill of health" |
+| No monitor results | empty quality table → looks clean | "an absence of evidence, not a pass — run `make monitor`" |
+| No previous run to diff | every finding listed as "new" | "nothing to diff against… not because it is new" |
+
+A monitor metric with no prior value prints `—`, never `0`: unchanged and
+never-measured are different facts, and printing zero for the second is a small
+lie that reads as a measurement.
+
+A finding kind the report has no section for is routed to Errors rather than
+dropped. A new check family that is measured, recorded, and invisible is the
+exact failure this file exists to prevent.
 
 ## Results
 

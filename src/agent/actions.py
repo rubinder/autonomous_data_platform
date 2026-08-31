@@ -11,6 +11,7 @@ from datetime import date
 from pathlib import Path
 
 from src import config
+from src.agent import sensors
 from src.agent.sensors import Finding
 
 INCIDENTS_DIR = config.REPO_ROOT / "docs" / "incidents"
@@ -19,15 +20,19 @@ INCIDENTS_DIR = config.REPO_ROOT / "docs" / "incidents"
 def incident_slug(finding: Finding) -> str:
     """Stable across runs so a recurring finding updates one file, not many.
 
-    Keyed on table + kind + the identifying bits of evidence (column, change)
-    rather than the human-readable `detail` string, so a rewording of the
-    message text doesn't spawn a new incident file for the same underlying
-    condition.
+    Keyed on `sensors.finding_key` -- table, kind, column, change and monitor
+    -- rather than on the human-readable `detail` string, so rewording a
+    message doesn't spawn a new file for the same underlying condition. Shared
+    with `ops.finding_log` so the file on disk and the logged history agree on
+    what "the same finding" means.
     """
-    key = (f"{finding.table}|{finding.kind}|{finding.evidence.get('column', '')}"
-           f"|{finding.evidence.get('change', '')}")
-    digest = hashlib.sha256(key.encode()).hexdigest()[:8]
-    column = finding.evidence.get("column", finding.kind)
+    digest = hashlib.sha256(sensors.finding_key(finding).encode()).hexdigest()[:8]
+    # `.get("column", kind)` was not enough: a monitor_breach carries
+    # `column: None` explicitly, so the default never applied and every such
+    # file was named `...-None-<digest>.md`.
+    column = (finding.evidence.get("column")
+              or finding.evidence.get("monitor")
+              or finding.kind)
     return f"{finding.table.replace('.', '-')}-{column}-{digest}"
 
 

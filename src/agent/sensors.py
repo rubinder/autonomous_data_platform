@@ -86,6 +86,29 @@ class Finding:
     evidence: dict = field(default_factory=dict)
 
 
+def finding_key(finding: Finding) -> str:
+    """The stable identity of a finding, across runs and across processes.
+
+    One implementation, two consumers: the incident filename and the
+    `ops.finding_log` row. They must agree, or the report's "first seen" and
+    the incident file on disk describe different things.
+
+    `monitor` is in the key and used to be missing from the incident slug's
+    equivalent, which meant every `monitor_breach` on one table hashed
+    identically -- `bronze.t|monitor_breach|None|` for all of them. With one
+    breach firing that was invisible; with two, the second incident file
+    silently overwrote the first, and a day-over-day diff would have reported
+    a finding as "cleared" while it was still breaching.
+    """
+    return "|".join((
+        finding.table,
+        finding.kind,
+        str(finding.evidence.get("column") or ""),
+        str(finding.evidence.get("change") or ""),
+        str(finding.evidence.get("monitor") or ""),
+    ))
+
+
 def build_rename_map(schema_versions: list[dict]) -> dict[str, tuple[str, int]]:
     """Every past name of a still-present column -> (current name, field id).
 

@@ -305,12 +305,50 @@ OPS_ALERT_LOG = TableDef(
     PartitionSpec(PartitionField(1, 1000, MonthTransform(), "run_at_month")),
 )
 
+# Every finding the agent has ever raised, one row per finding per run.
+# Append-only and keyed on `finding_key`, which is what makes "first seen",
+# "still open", and "cleared" answerable at all. `docs/incidents/*.md` cannot
+# answer them: the incident slug is deliberately stable so a recurring finding
+# updates one file rather than spawning many, which means every write
+# overwrites the previous state and yesterday is gone.
+OPS_FINDING_LOG = TableDef(
+    "ops.finding_log",
+    Schema(
+        NestedField(1, "run_at", DateType(), required=True),
+        NestedField(2, "finding_key", StringType(), required=True),
+        NestedField(3, "table_name", StringType(), required=True),
+        NestedField(4, "kind", StringType(), required=True),
+        NestedField(5, "severity", StringType(), required=True),
+        NestedField(6, "column_name", StringType(), required=False),
+        NestedField(7, "detail", StringType(), required=False),
+        NestedField(8, "reasoning", StringType(), required=False),
+        NestedField(9, "evidence", StringType(), required=False),
+        NestedField(10, "actioned", BooleanType(), required=False),
+    ),
+    PartitionSpec(PartitionField(1, 1000, MonthTransform(), "run_at_month")),
+)
+
+# One row per agent run, findings or not. Without it, "the agent ran and found
+# nothing" and "the agent never ran" are the same absence of rows in
+# `finding_log` -- and a report that cannot tell those apart is precisely the
+# empty-delta blind spot this codebase keeps having to close.
+OPS_AGENT_RUNS = TableDef(
+    "ops.agent_runs",
+    Schema(
+        NestedField(1, "run_at", DateType(), required=True),
+        NestedField(2, "findings_count", LongType(), required=True),
+        NestedField(3, "actioned_count", LongType(), required=True),
+        NestedField(4, "dry_run", BooleanType(), required=False),
+    ),
+    PartitionSpec(PartitionField(1, 1000, MonthTransform(), "run_at_month")),
+)
+
 ALL_TABLES: tuple[TableDef, ...] = (
     BRONZE_TRANSACTIONS, BRONZE_ACCOUNTS, BRONZE_PRICES,
     SILVER_TRANSACTIONS, SILVER_QUARANTINE, SILVER_ACCOUNTS,
     SILVER_MERCHANT_MAP, SILVER_PRICES,
     GOLD_SPEND, GOLD_STOCK_FEATURES, GOLD_TRAINING, GOLD_PREDICTIONS,
-    OPS_MONITOR_RESULTS, OPS_ALERT_LOG,
+    OPS_MONITOR_RESULTS, OPS_ALERT_LOG, OPS_FINDING_LOG, OPS_AGENT_RUNS,
 )
 
 
