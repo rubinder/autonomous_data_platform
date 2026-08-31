@@ -90,17 +90,43 @@ def evolve_rename_column(engine, old: str, new: str, ident: str = IDENT) -> bool
     return True
 
 
+# The evolution schedule, one entry per simulated day. Applying it a day at a
+# time is what gives `make report` a story to diff: run the agent between
+# steps and the finding log records a schema change appearing on one day,
+# persisting across the next, and being resolved when the contract catches up.
+# Applying all four at once -- which `evolve_all()` still does -- produces one
+# before and one after, and no narrative in between.
+EVOLUTION_SCHEDULE: tuple[tuple[int, str], ...] = (
+    (1, "v2: +merchantCategoryCode (string)"),
+    (2, "v3: +settlementDays (int)"),
+    (3, "v4: settlementDays int -> long"),
+    (4, "v5: checkNumber -> check_reference"),
+)
+
+
+def evolve_day(engine, day: int, ident: str = IDENT) -> list[str]:
+    """Apply only the change scheduled for `day`. Idempotent per day."""
+    applied: list[str] = []
+    if day == 1 and evolve_add_column(
+            engine, "merchantCategoryCode", StringType(), ident):
+        applied.append(EVOLUTION_SCHEDULE[0][1])
+    elif day == 2 and evolve_add_column(
+            engine, "settlementDays", IntegerType(), ident):
+        applied.append(EVOLUTION_SCHEDULE[1][1])
+    elif day == 3 and evolve_widen_column(
+            engine, "settlementDays", LongType(), ident):
+        applied.append(EVOLUTION_SCHEDULE[2][1])
+    elif day == 4 and evolve_rename_column(
+            engine, "checkNumber", "check_reference", ident):
+        applied.append(EVOLUTION_SCHEDULE[3][1])
+    return applied
+
+
 def evolve_all(engine, ident: str = IDENT) -> list[str]:
     """The v2 -> v5 sequence. Idempotent: re-running applies nothing."""
     applied = []
-    if evolve_add_column(engine, "merchantCategoryCode", StringType(), ident):
-        applied.append("v2: +merchantCategoryCode (string)")
-    if evolve_add_column(engine, "settlementDays", IntegerType(), ident):
-        applied.append("v3: +settlementDays (int)")
-    if evolve_widen_column(engine, "settlementDays", LongType(), ident):
-        applied.append("v4: settlementDays int -> long")
-    if evolve_rename_column(engine, "checkNumber", "check_reference", ident):
-        applied.append("v5: checkNumber -> check_reference")
+    for day, _ in EVOLUTION_SCHEDULE:
+        applied += evolve_day(engine, day, ident)
     return applied
 
 
@@ -253,6 +279,23 @@ def expire(engine, retain_last: int = 5) -> int:
     return removed
 
 
+def _day_arg() -> int | None:
+    """`--day N`, or None. Fails loudly on a malformed value rather than
+    silently falling back to the all-at-once path, which would look like the
+    command worked."""
+    if "--day" not in sys.argv:
+        return None
+    index = sys.argv.index("--day")
+    if index + 1 >= len(sys.argv):
+        raise SystemExit("drift-demo: --day requires a day number")
+    try:
+        return int(sys.argv[index + 1])
+    except ValueError:
+        raise SystemExit(
+            f"drift-demo: --day takes an integer, got {sys.argv[index + 1]!r}"
+        ) from None
+
+
 def main() -> int:
     command = sys.argv[1] if len(sys.argv) > 1 else "timetravel"
     engine = get_engine()
@@ -264,13 +307,26 @@ def main() -> int:
             print(f"timetravel: {key} = {value:,}")
 
     elif command == "drift-demo":
-        applied = evolve_all(engine)
-        for step in applied:
-            print(f"drift-demo: applied {step}")
-        if not applied:
-            print("drift-demo: schema already evolved, nothing to apply")
-        added = inject_volume_collapse(engine)
-        print(f"drift-demo: appended a collapsed batch of {added} rows")
+        # `--day N` applies only that day's scheduled change and leaves the
+        # volume alone, so a caller can interleave `make agent` between days
+        # and build a real timeline. Bare `drift-demo` keeps its original
+        # behaviour exactly: everything at once, plus the collapsed batch.
+        day = _day_arg()
+        if day is not None:
+            applied = evolve_day(engine, day)
+            for step in applied:
+                print(f"drift-demo: day {day} applied {step}")
+            if not applied:
+                print(f"drift-demo: day {day} had nothing to apply "
+                      "(already applied, or no change scheduled)")
+        else:
+            applied = evolve_all(engine)
+            for step in applied:
+                print(f"drift-demo: applied {step}")
+            if not applied:
+                print("drift-demo: schema already evolved, nothing to apply")
+            added = inject_volume_collapse(engine)
+            print(f"drift-demo: appended a collapsed batch of {added} rows")
         print("drift-demo: run `make agent` to see these detected")
 
     elif command == "schema-history":

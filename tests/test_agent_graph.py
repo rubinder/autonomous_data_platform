@@ -69,6 +69,17 @@ class _FakeEngine:
         self._enum_watch = contract.enum_watch
         if drop_column:
             self._columns.pop("baseType", None)
+        # Recording rather than no-op: the persist node's whole job is what it
+        # writes, so a stub that silently swallowed the writes would let the
+        # node be deleted with every test still green.
+        self.created: list[str] = []
+        self.appended: dict[str, list[dict]] = {}
+
+    def create_table(self, table_def):
+        self.created.append(table_def.name)
+
+    def append(self, ident, data):
+        self.appended.setdefault(ident, []).extend(data.to_pylist())
 
     def scan_arrow(self, ident, snapshot_id=None):
         import pyarrow as pa
