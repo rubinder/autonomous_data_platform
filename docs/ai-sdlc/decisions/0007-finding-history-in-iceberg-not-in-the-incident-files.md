@@ -91,6 +91,27 @@ have to agree, or "first seen" describes something different from the file on
 disk. The filename also stopped rendering `None` for breaches that carry no
 column.
 
+## Review round: two defects the tests did not reach
+
+**1. Running `make agent` twice in one day doubled the findings.**
+`ops.finding_log` is append-only, and re-running the agent on the same date is
+an entirely ordinary thing for a human to do. The report counted *rows*, not
+findings, so a second run turned one open finding into "2 still open". A
+day-over-day diff whose counts are wrong is worse than no diff at all, because
+the counts are read as a measurement. `_latest_per_key` now collapses to one row
+per `finding_key` per run; the same applies to `make monitor`.
+
+**2. The report was not byte-stable across regenerations.**
+The diff sections were built from set differences and rendered in set-iteration
+order, so simply regenerating a report reshuffled its lines. These are committed
+artifacts: an unstable render produces a git diff on every regeneration that has
+nothing to do with what changed, and a diff that is usually noise is a diff
+nobody reads. Now sorted by finding key, with a test that renders twice and
+compares.
+
+Both were found by probing the shipped code, not by re-reading the diff. Neither
+would have failed a test that only asked "does the report render?"
+
 ## Scope note
 
 `drift-demo --day N` was added because the report needed something to narrate.

@@ -71,6 +71,21 @@ def _as_date(value) -> date | None:
     return value.date() if hasattr(value, "date") else value
 
 
+def _latest_per_key(rows: list[dict]) -> list[dict]:
+    """One row per `finding_key`, last write wins.
+
+    `ops.finding_log` is append-only, so running `make agent` twice on the same
+    date -- an entirely ordinary thing for a human to do -- writes the same
+    logical finding twice. Counting rows instead of findings then reports "2
+    still open" where one finding exists, and the diff's whole value is that
+    its counts mean something.
+    """
+    latest: dict[str, dict] = {}
+    for row in rows:
+        latest[row["finding_key"]] = row
+    return list(latest.values())
+
+
 def load_snapshot(engine, as_of: date) -> ReportSnapshot:
     """Select everything the report needs for `as_of`. The only engine call."""
     runs = [_as_date(r["run_at"]) for r in _rows(
@@ -84,8 +99,9 @@ def load_snapshot(engine, as_of: date) -> ReportSnapshot:
     for row in findings:
         row["run_at"] = _as_date(row["run_at"])
 
-    today = [f for f in findings if f["run_at"] == as_of]
-    prior = [f for f in findings if f["run_at"] == previous] if previous else []
+    today = _latest_per_key([f for f in findings if f["run_at"] == as_of])
+    prior = _latest_per_key(
+        [f for f in findings if f["run_at"] == previous]) if previous else []
 
     # First time each key was ever seen, across the whole log.
     first_seen: dict[str, date] = {}
@@ -105,9 +121,13 @@ def load_snapshot(engine, as_of: date) -> ReportSnapshot:
                      default=None)
         monitors_today = [m for m in monitor_rows if m["run_at"] == newest]
 
+    monitors_today = list({m["monitor"]: m for m in monitors_today}.values())
+
     monitor_runs = sorted({m["run_at"] for m in monitor_rows})
     current_run = monitors_today[0]["run_at"] if monitors_today else None
     prior_runs = [r for r in monitor_runs if current_run and r < current_run]
+    # Same dedupe reasoning as `_latest_per_key`: a second `make monitor` on
+    # one date must not turn one metric into two.
     previous_monitors = {
         m["monitor"]: m["metric"]
         for m in monitor_rows if prior_runs and m["run_at"] == prior_runs[-1]
@@ -329,9 +349,16 @@ def _diff_section(snapshot: ReportSnapshot) -> list[str]:
 
     today = {f["finding_key"]: f for f in snapshot.findings}
     prior = {f["finding_key"]: f for f in snapshot.previous_findings}
-    new = [today[k] for k in today.keys() - prior.keys()]
-    cleared = [prior[k] for k in prior.keys() - today.keys()]
-    still = [today[k] for k in today.keys() & prior.keys()]
+    # Sorted, not set-iteration order. These are committed artifacts: a report
+    # whose lines shuffle between runs produces a git diff on every
+    # regeneration that has nothing to do with what changed, and a diff that is
+    # usually noise is a diff nobody reads.
+    def _ordered(keys, source):
+        return [source[k] for k in sorted(keys)]
+
+    new = _ordered(today.keys() - prior.keys(), today)
+    cleared = _ordered(prior.keys() - today.keys(), prior)
+    still = _ordered(today.keys() & prior.keys(), today)
 
     lines.append(f"Compared with `{snapshot.previous_run}`: "
                  f"**{len(new)} new**, **{len(cleared)} cleared**, "

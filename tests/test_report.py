@@ -304,3 +304,62 @@ def test_findings_written_by_the_agent_are_keyed_consistently(engine):
         # and the incident slug is derived from the same key
         assert actions.incident_slug(item["finding"]).endswith(
             __import__("hashlib").sha256(key.encode()).hexdigest()[:8])
+
+
+def test_running_the_agent_twice_in_one_day_does_not_double_the_findings(engine):
+    """`ops.finding_log` is append-only and re-running `make agent` is
+    ordinary. Counting rows instead of findings reported "2 still open" for a
+    single finding -- and a diff whose counts are wrong is worse than no diff,
+    because it is read as a measurement."""
+    maintenance.evolve_day(engine, 1)
+    graph.run(engine=engine, dry_run=True, as_of=D2)
+    graph.run(engine=engine, dry_run=True, as_of=D2)   # a human re-runs it
+
+    snapshot = report.load_snapshot(engine, D2)
+    keys = [f["finding_key"] for f in snapshot.findings]
+    assert len(keys) == len(set(keys)), f"duplicate findings in one run: {keys}"
+
+    graph.run(engine=engine, dry_run=True, as_of=D3)
+    text = report.build_report(report.load_snapshot(engine, D3))
+    assert "**0 new**, **0 cleared**, **1 still open**" in text
+
+
+def test_running_monitors_twice_in_one_day_does_not_double_the_rows(engine):
+    runner.persist(engine, runner.run_monitors(engine, D3))
+    runner.persist(engine, runner.run_monitors(engine, D3))
+    graph.run(engine=engine, dry_run=True, as_of=D3)
+
+    snapshot = report.load_snapshot(engine, D3)
+    names = [m["monitor"] for m in snapshot.monitors]
+    assert len(names) == len(set(names)), "monitor rows duplicated for one run"
+
+
+def test_a_pipe_in_a_detail_string_does_not_break_the_table():
+    """Detail text is machine-generated but carries column names and values;
+    an unescaped `|` silently splits a Markdown table cell."""
+    text = report.build_report(_snapshot(findings=[
+        _finding("k", D3, kind="staleness", detail="a | b | c")]))
+    row = next(ln for ln in text.splitlines()
+               if ln.startswith("| `breaking`") and "b" in ln)
+    assert "\\|" in row, "the pipe in the detail text was not escaped"
+    # Escaped pipes still contain a `|` character, so strip them before
+    # counting the structural ones: four cells means five separators.
+    assert row.replace("\\|", "").count("|") == 5, (
+        f"pipe leaked into the table structure: {row}")
+
+
+def test_the_report_is_byte_stable_across_regeneration(engine):
+    """Reports are committed artifacts. Set-iteration order made the diff
+    sections shuffle between runs, producing a git diff on every regeneration
+    that had nothing to do with what changed."""
+    maintenance.evolve_day(engine, 1)
+    graph.run(engine=engine, dry_run=True, as_of=D2)
+    maintenance.evolve_day(engine, 4)
+    graph.run(engine=engine, dry_run=True, as_of=D3)
+
+    first = report.build_report(report.load_snapshot(engine, D3))
+    second = report.build_report(report.load_snapshot(engine, D3))
+    assert first == second
+
+    # and stable across a fresh load, not just a repeated render
+    assert report.build_report(report.load_snapshot(engine, D3)) == first
