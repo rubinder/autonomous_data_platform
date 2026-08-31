@@ -363,3 +363,43 @@ def test_the_report_is_byte_stable_across_regeneration(engine):
 
     # and stable across a fresh load, not just a repeated render
     assert report.build_report(report.load_snapshot(engine, D3)) == first
+
+
+def test_float_noise_is_not_rendered_as_a_change():
+    """DuckDB sums in parallel, so a mean over 250k rows differs in its last
+    bits between runs of identical code. Rendering that as `+1.56e-12` presents
+    noise as signal and churns the committed reports on every regeneration."""
+    snapshot = _snapshot(
+        monitors=[{"monitor": "mean", "table_name": "t",
+                   "metric": 171.41370268000063, "baseline_median": 171.4,
+                   "status": "ok", "run_at": D3}],
+        previous_monitors={"mean": 171.41370268000023})
+    row = next(ln for ln in report.build_report(snapshot).splitlines()
+               if "`mean`" in ln)
+    assert "e-13" not in row and "e-12" not in row
+    assert "| 0 |" in row
+
+
+def test_a_real_change_is_still_rendered():
+    """The noise threshold must not swallow a change a monitor could act on."""
+    snapshot = _snapshot(
+        monitors=[{"monitor": "mean", "table_name": "t", "metric": 171.5,
+                   "baseline_median": 171.4, "status": "ok", "run_at": D3}],
+        previous_monitors={"mean": 171.4})
+    row = next(ln for ln in report.build_report(snapshot).splitlines()
+               if "`mean`" in ln)
+    assert "+0.1" in row
+
+
+def test_findings_sharing_a_first_seen_date_are_ordered_deterministically():
+    """Several findings raised on one day share a `first_seen`; without a
+    tiebreak their order followed whatever order the checks ran in, so
+    reordering the config churned the table with no change in content."""
+    findings = [_finding(k, D3, kind="staleness", detail=f"d-{k}")
+                for k in ("zebra", "alpha", "middle")]
+    first = report.build_report(_snapshot(findings=findings, first_seen={
+        k: D3 for k in ("zebra", "alpha", "middle")}))
+    second = report.build_report(_snapshot(findings=list(reversed(findings)),
+                                            first_seen={k: D3 for k in
+                                                        ("zebra", "alpha", "middle")}))
+    assert first == second, "render depends on the order findings arrive in"

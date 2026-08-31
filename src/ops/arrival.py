@@ -10,7 +10,7 @@ import sys
 from dataclasses import dataclass
 from datetime import date, timedelta
 
-from src import config
+from src import config, feeds
 from src.lakehouse import bronze
 from src.lakehouse.engines import get_engine
 from src.ops.monitors import MonitorResult
@@ -35,19 +35,21 @@ class ArrivalSLA:
     min_rows_per_period: int | None
 
 
-ARRIVAL_SLAS: tuple[ArrivalSLA, ...] = (
-    # silver.transactions has no structural floor -- transactions per day is a
-    # volume, not a shape, and it varies with N_TRANSACTIONS. Thinness there is
-    # what the volume monitors in `monitors/silver.yaml` measure against a
-    # trailing median; there is nothing honest to assert here, so nothing is.
-    ArrivalSLA("silver.transactions", "txn_date", "trading", 3, None),
-    # One price row per company per trading day, by construction.
-    ArrivalSLA("silver.stock_prices", "trade_date", "trading", 3,
-               len(config.COMPANIES)),
-    # One training row per company per trading day, joined from the above.
-    ArrivalSLA("gold.forecast_training_set", "trade_date", "trading", 5,
-               len(config.COMPANIES)),
-)
+def _slas_from_feeds(directory=None) -> tuple[ArrivalSLA, ...]:
+    """Arrival SLAs, declared per feed in `feeds/*.yaml`.
+
+    These used to be a hardcoded tuple here, which meant a new feed's SLA was
+    a Python edit in a module that otherwise knows nothing about any specific
+    feed. The comments that justified each floor moved into the feed files
+    alongside the rest of that feed's operational config.
+    """
+    return tuple(
+        ArrivalSLA(a.table, a.column, a.calendar, a.max_lag_periods,
+                   a.min_rows_per_period)
+        for feed in feeds.load_feeds(directory) for a in feed.arrival)
+
+
+ARRIVAL_SLAS: tuple[ArrivalSLA, ...] = _slas_from_feeds()
 
 
 def expected_periods(calendar: str, start: date, end: date) -> list[date]:

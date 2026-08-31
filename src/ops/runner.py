@@ -13,16 +13,11 @@ from datetime import date
 
 import pyarrow as pa
 
-from src import config
+from src import config, feeds
 from src.contracts import validator
 from src.lakehouse import bronze, schemas
 from src.lakehouse.engines import get_engine
 from src.ops import alerts, monitors
-
-TYPED_TABLES = (
-    (schemas.SILVER_TRANSACTIONS, "silver_transactions.yaml"),
-    (schemas.GOLD_TRAINING, "gold_forecast_training_set.yaml"),
-)
 
 # Monitor names are repo-owned (they come from monitors/*.yaml, not from
 # any external or user-supplied input), which is what makes f-string
@@ -60,10 +55,18 @@ def load_baselines(engine, monitor: str, column: str | None = None,
     return [row["metric"] for row in rows]
 
 
-def run_monitors(engine, as_of: date, monitor_dir=None) -> list[monitors.MonitorResult]:
-    results: list[monitors.MonitorResult] = []
+def run_monitors(engine, as_of: date, feed_dir=None) -> list[monitors.MonitorResult]:
+    """Every monitor declared by every feed, plus per-contract type checks.
 
-    for definition in monitors.load_monitors(monitor_dir):
+    Both come from `feeds/*.yaml` now. A feed that declares `typed: true` on a
+    layer gets one column-type monitor per contract field on that layer; the
+    loader refuses `typed: true` without a contract, because a typed layer with
+    no contract silently produces zero type checks and reads as coverage.
+    """
+    results: list[monitors.MonitorResult] = []
+    all_feeds = feeds.load_feeds(feed_dir)
+
+    for definition in (m for f in all_feeds for m in f.monitors):
         required_tables = (definition.table, *(definition.tables or {}).values())
         if not all(engine.table_exists(t) for t in required_tables):
             continue
@@ -93,12 +96,15 @@ def run_monitors(engine, as_of: date, monitor_dir=None) -> list[monitors.Monitor
             statistics.median(baseline) if baseline else None,
             status, detail, as_of))
 
-    for table_def, contract_file in TYPED_TABLES:
-        if not engine.table_exists(table_def.name):
-            continue
-        contract = validator.load_contract(
-            validator.CONTRACTS_DIR / contract_file)
-        results += monitors.check_column_types(engine, table_def, contract, as_of)
+    for feed in all_feeds:
+        for layer in feed.typed_layers:
+            table_def = feeds.table_def_for(layer.table)
+            if not engine.table_exists(table_def.name):
+                continue
+            contract = validator.load_contract(
+                validator.CONTRACTS_DIR / layer.contract)
+            results += monitors.check_column_types(
+                engine, table_def, contract, as_of)
 
     return results
 

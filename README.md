@@ -47,6 +47,9 @@ A complete data platform, built end to end, small enough to read:
 - **17 data-quality monitors + 8 arrival checks** with persisted metric history
   and robust (median/MAD) baselines. 10 of the 17 are declared in YAML; the
   other 7 are column-type checks generated per contract field.
+- **One engine, many feed configs** — a feed is one `feeds/<name>.yaml`
+  declaring its layers, contracts, monitors, arrival SLAs and whether the agent
+  watches it. Adding a feed is one file and **zero Python edits**.
 - **A daily report that tells the story** — `make report` assembles verdict,
   schema evolution, data quality, anomalies, errors and a **day-over-day diff**
   from `ops.*`. It reads; it never recomputes. A three-day sample sequence is in
@@ -173,7 +176,7 @@ uv run make lint           # ruff
 | Target | What it does |
 |---|---|
 | `make all` | `bronze silver gold forecast` end to end, offline, deterministic |
-| `make monitor` | 17 data-quality checks; persists metrics to `ops.monitor_results` and routes alerts to `ops.alert_log` (**dry-run** unless `--execute`) |
+| `make monitor` | 17 data-quality checks declared across `feeds/*.yaml`; persists metrics to `ops.monitor_results` and routes alerts to `ops.alert_log` (**dry-run** unless `--execute`) |
 | `make report` | the daily platform report for `AS_OF_DATE`, assembled from `ops.*` and written to `reports/daily-<date>.md` |
 | `make arrival` | 8 checks across 3 arrival SLAs, on the NYSE trading calendar |
 | `make agent` | the LangGraph ops agent (**dry-run** unless `--execute`) |
@@ -346,10 +349,10 @@ monitors: 17 checks at as_of=2026-06-30 — 0 breach, 0 warn
 monitors: no alertable results, nothing routed
 ```
 
-**Where the 17 come from, precisely.** Ten are declared in
-`monitors/{bronze,silver,gold}.yaml` (2 bronze / 6 silver / 2 gold) as a SQL
-query plus a judging rule — for those, adding a check really is a data change,
-not a code change. The other seven are column-type checks generated in Python,
+**Where the 17 come from, precisely.** Ten are declared in `feeds/*.yaml`
+(8 on `yodlee_transactions`, 2 on `forecast_training_set`) as a SQL query plus
+a judging rule — for those, adding a check really is a data change, not a code
+change. The other seven are column-type checks generated in Python,
 one per field of the two typed contracts, and they carry **`metric=None`**:
 a declared type either matches the physical Arrow type or it does not, so there
 is no number to trend. Baselines are read with `metric IS NOT NULL`, which is
@@ -553,6 +556,112 @@ real Iceberg table; type *narrowing* is covered by unit test only, because
 PyIceberg will not narrow a column type and faking that state would misrepresent
 what the storage layer does
 ([decisions/0005](docs/ai-sdlc/decisions/0005-drift-scenario-coverage-split.md)).
+
+## One engine, many feed configs
+
+The operating claim is a reusable engine driven by declarative config. Until
+recently that was two thirds true, and the missing third was the *axis*.
+
+Config existed — `monitors/{bronze,silver,gold}.yaml` declared ten monitors
+against a validated `KINDS` registry — but it was organised **by layer**. A feed
+was therefore spread across four places, three of them Python:
+
+| Was | Held |
+|---|---|
+| `monitors/{bronze,silver,gold}.yaml` | monitor definitions, keyed by layer |
+| `graph.py:WATCHED` | which table the agent senses, and its freshness column |
+| `arrival.py:ARRIVAL_SLAS` | arrival SLAs, as a hardcoded tuple |
+| `runner.py:TYPED_TABLES` | which contracts get per-column type checks |
+
+Adding a feed meant editing every layer file plus three Python modules, and no
+single place described one feed. `feeds/<name>.yaml` inverts it:
+
+```yaml
+name: yodlee_transactions
+feed_type: fact
+ingest: {mode: batch}
+layers:
+  bronze:
+    table: bronze.yodlee_transactions_raw
+    contract: bronze_yodlee_transactions.yaml
+    freshness_column: transactionDate
+    agent_watch: true          # the ops agent senses this layer
+  silver:
+    table: silver.transactions
+    contract: silver_transactions.yaml
+    typed: true                # one column-type monitor per contract field
+monitors:
+  - {name: silver_txn_row_count, layer: silver, kind: row_count, ...}
+arrival:
+  - {layer: silver, column: txn_date, calendar: trading, max_lag_periods: 3}
+```
+
+Three feeds today: `yodlee_transactions`, `stock_prices`, and
+`forecast_training_set` — the last a *derived* feed, because a Gold mart has the
+same operational needs as an ingested one and belongs to neither upstream feed
+cleanly.
+
+The Iceberg schemas stay in Python (`src/lakehouse/schemas.py`). They declare
+field IDs and partition transforms; that is code, and pretending otherwise would
+be config theatre.
+
+### The migration was gated on measurement, not on the tests passing
+
+The risk in a migration like this is not that it fails loudly. It is that it
+**succeeds while quietly changing a threshold, dropping a monitor, or widening
+an SLA** — and every test still passes, because the tests were written against
+the same config that moved.
+
+So the gate came first: before any code changed, the exact output of
+`run_monitors`, `check_arrival` and the agent was captured on two warehouses —
+a clean one and a drifted one. The drifted capture matters, because a
+comparison against an all-`ok` baseline would be satisfied by a migration that
+broke every check into silence.
+
+**It caught a real bug immediately.** Removing a now-unused import left a
+`NameError` in `runner`, and `run_monitors`'s deliberately broad `except`
+converted it into a **breach on all seventeen monitors**. Seventeen results
+appeared, the run exited non-zero, and a glance at the output would have read
+as "the monitors are working". Only the before/after comparison showed every
+`metric` had become `null` and every `detail` read
+`monitor failed: NameError: name 'schemas' is not defined`.
+
+After the fix, both captures match exactly: 17 monitor results, 8 arrival
+checks, and — on the drifted warehouse — the same 5 findings with the same
+severities.
+
+The one difference was `silver_txn_mean_abs_amount`, at the 13th decimal place.
+That turned out **not** to be the migration: three consecutive runs of identical
+code return `171.4137026799999`, `171.41370268000034` and `171.4137026800003`,
+because DuckDB sums in parallel. The report used to render that as a
+`+1.56e-12` change; it now renders `0` below a relative threshold of `1e-9`,
+since presenting floating-point noise as signal churns the committed reports on
+every regeneration.
+
+The pinned values live in `tests/test_feeds.py` as literals — deliberately not
+derived from `feeds/*.yaml`, because a check that reads its expectation from the
+thing under test checks nothing.
+
+### What the loader refuses
+
+Config that cannot be trusted fails loudly and names the offending key, the same
+posture `monitors.evaluate()` takes towards an unrecognised `kind`:
+
+- a monitor on a `layer` the feed does not declare
+- a layer naming a table absent from `schemas.ALL_TABLES`
+- a `contract:` file that does not exist
+- **`typed: true` with no contract** — column-type monitors are generated per
+  contract field, so this would produce zero checks and read as coverage
+- an unknown `calendar`, `ingest.mode`, `feed_type`, or symbolic row floor
+- **a duplicate monitor name across feeds** — monitor names are the join key
+  between a definition and its persisted baseline history, so two feeds sharing
+  one would interleave different measurements into a single baseline series
+
+A typo'd `kind` is now caught here rather than surfacing as a breach. That is a
+change in behaviour and an improvement: a breach means *your data is bad*, and a
+typo means *your config is bad*. The runtime path that converted such a typo
+into a breach is **kept** — a `MonitorDef` can be built without the loader, and
+one bad monitor must never take down the other sixteen — and it has its own test.
 
 ## The daily report
 

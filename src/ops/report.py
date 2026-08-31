@@ -191,6 +191,15 @@ def _delta(current, previous) -> str:
     if current is None or previous is None:
         return "—"
     change = current - previous
+    # Below this, a "change" is floating-point noise, not data. DuckDB sums in
+    # parallel, so `avg(abs(signed_amount))` over 250k rows returns a slightly
+    # different last few bits on every run -- three consecutive runs of
+    # identical code give 171.4137026799999, ...800034 and ...800003. Rendering
+    # that as `+1.56e-12` presents noise as signal and churns the committed
+    # reports on every regeneration. The threshold is relative, and ~6 orders
+    # of magnitude below any change a monitor could act on.
+    if current and abs(change) < abs(current) * 1e-9:
+        return "0"
     if change == 0:
         return "0"
     return f"{'+' if change > 0 else ''}{_num(change)}"
@@ -220,8 +229,9 @@ def _verdict(snapshot: ReportSnapshot) -> list[str]:
              "that anything was checked. Run `make agent` for this date."),
         ]
 
-    blocking = [f for f in snapshot.findings
-                if f["severity"] in ACTIONABLE_SEVERITIES]
+    blocking = sorted((f for f in snapshot.findings
+                       if f["severity"] in ACTIONABLE_SEVERITIES),
+                      key=lambda x: (x["severity"], x["finding_key"]))
     failed_monitors = [m for m in snapshot.monitors if m["status"] == "breach"]
 
     if not blocking and not failed_monitors:
@@ -249,7 +259,7 @@ def _findings_table(snapshot: ReportSnapshot, findings: list[dict]) -> list[str]
     if not findings:
         return ["_Nothing in this section for this run._"]
     lines = ["| Severity | Table | What | Age |", "|---|---|---|---|"]
-    for f in sorted(findings, key=lambda x: x["severity"]):
+    for f in sorted(findings, key=lambda x: (x["severity"], x["finding_key"])):
         detail = (f.get("detail") or "").replace("|", "\\|")
         lines.append(f"| `{f['severity']}` | `{f['table_name']}` | {detail} "
                      f"| {_age(snapshot, f['finding_key'])} |")
@@ -263,7 +273,7 @@ def _schema_section(snapshot: ReportSnapshot) -> list[str]:
         lines.append("No schema or enum change observed against the registered "
                      "contracts this run.")
         return lines
-    for f in sorted(findings, key=lambda x: x["kind"]):
+    for f in sorted(findings, key=lambda x: (x["kind"], x["finding_key"])):
         evidence = _evidence(f)
         change = evidence.get("change") or evidence.get("error") or f["kind"]
         lines.append(f"### `{change}` — {f['table_name']}")
@@ -318,7 +328,7 @@ def _anomaly_section(snapshot: ReportSnapshot) -> list[str]:
     if not findings:
         lines.append("No volume or distribution anomaly raised this run.")
         return lines
-    for f in findings:
+    for f in sorted(findings, key=lambda x: x["finding_key"]):
         evidence = _evidence(f)
         lines.append(f"- **{f['detail']}**")
         if evidence.get("median") is not None:
@@ -391,9 +401,15 @@ def _incidents_section(snapshot: ReportSnapshot) -> list[str]:
         lines.append("None open.")
         return lines
     lines += ["| Severity | Table | Detail | Age |", "|---|---|---|---|"]
+    # `finding_key` is the tiebreak, not decoration: several findings raised on
+    # the same day share a `first_seen`, and without it their order followed
+    # whatever order the checks happened to run in. Reordering the config
+    # (feeds are loaded alphabetically) then churned this table with no change
+    # in content -- the same instability already fixed in the diff sections.
     for f in sorted(open_incidents,
-                    key=lambda x: snapshot.first_seen.get(x["finding_key"],
-                                                          snapshot.as_of)):
+                    key=lambda x: (snapshot.first_seen.get(x["finding_key"],
+                                                           snapshot.as_of),
+                                   x["finding_key"])):
         detail = (f.get("detail") or "").replace("|", "\\|")
         lines.append(f"| `{f['severity']}` | `{f['table_name']}` | {detail} "
                      f"| {_age(snapshot, f['finding_key'])} |")
@@ -401,7 +417,13 @@ def _incidents_section(snapshot: ReportSnapshot) -> list[str]:
 
 
 def build_report(snapshot: ReportSnapshot) -> str:
-    """Render `snapshot`. Takes no engine and computes no metric of its own."""
+    """Render `snapshot`. Takes no engine and computes no metric of its own.
+
+    Every list rendered below is sorted on a key ending in `finding_key` or
+    `monitor`, so the output depends only on *what* is in the snapshot and
+    never on the order it arrived in. Reports are committed artifacts; a render
+    that varies with check-execution order puts noise in every git diff.
+    """
     parts: list[list[str]] = [
         [f"# Daily platform report — {snapshot.as_of}", "",
          ("_Assembled from `ops.agent_runs`, `ops.finding_log`, "
