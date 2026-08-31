@@ -39,3 +39,30 @@ expectations:
   - {type: accepted_values, column: baseType, values: [CREDIT, DEBIT]}
   - {type: row_count, min: 1000}
   - {type: freshness, column: transactionDate, max_lag_days: 3}
+
+# Categorical columns watched for NEW values. Deliberately separate from
+# `expectations`: an `accepted_values` expectation is a fail-closed gate that
+# stops the build, which is right for `baseType` (the pipeline's sign
+# convention branches on it -- an unrecognised value would silently mis-sign
+# spend) and wrong for everything below, where upstream adding a category
+# breaks nothing but must not pass unnoticed.
+#
+# `baseType` is deliberately NOT repeated here. One column, one semantics:
+# it is a gate, not a watch.
+enum_watch:
+  - column: category
+    known_values: [Restaurants/Dining, General Merchandise, Clothing/Shoes,
+                   Personal Care, Other Expenses]
+  - column: detailCategory
+    known_values: [Coffee Shop, Fast Food, Department Store, Athletic Apparel,
+                   Pizza, Cosmetics, Uncategorized]
+  - column: subType
+    known_values: [PAYMENT, CREDIT]
+  - column: categoryType
+    known_values: [EXPENSE, INCOME]
+  - column: status
+    known_values: [POSTED]
+  - column: categorySource
+    known_values: [SYSTEM]
+  - column: sourceType
+    known_values: [AGGREGATED]

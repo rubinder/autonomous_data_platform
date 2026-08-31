@@ -23,7 +23,12 @@ from src.ops import arrival, runner
 WATCHED = (
     (schemas.BRONZE_TRANSACTIONS, "bronze_yodlee_transactions.yaml", "transactionDate"),
 )
-ACTIONABLE = {"breaking"}  # additive/benign are recorded but take no action
+# A severity is only worth having if it changes what the agent does.
+# `renaming` is actionable because the published contract now names a column
+# that does not exist -- nothing is lost, but a human has to record the
+# decision before the contract is true again. `widening`, `additive` and
+# `enum_drift` are recorded and reported; none of them needs anyone woken up.
+ACTIONABLE = {"breaking", "renaming"}
 
 
 class AgentState(TypedDict, total=False):
@@ -40,7 +45,11 @@ def sense_and_detect(state: AgentState) -> AgentState:
     findings: list[sensors.Finding] = []
     for table_def, contract_file, date_column in WATCHED:
         contract = validator.load_contract(validator.CONTRACTS_DIR / contract_file)
-        observed = sensors.observe(engine, table_def, date_column=date_column)
+        # The caller owns the contract, so it -- not the sensor -- resolves
+        # which columns to read values for, the same way `date_column` works.
+        enum_columns = tuple(w["column"] for w in contract.enum_watch)
+        observed = sensors.observe(engine, table_def, date_column=date_column,
+                                   enum_columns=enum_columns)
         # Trailing history excludes the latest snapshot -- comparing a batch
         # against a median that includes itself blunts the signal.
         per_snapshot = engine.snapshot_row_counts(table_def.name)

@@ -37,6 +37,15 @@ class Contract:
     owner: str
     schema_fields: tuple[SchemaField, ...]
     expectations: tuple[dict, ...]
+    # Kept out of `expectations` on purpose. Everything in `expectations` is a
+    # fail-closed gate -- `assert_valid` raises on any failure, and
+    # `_evaluate` raises on any type it does not recognise, which is what
+    # stops a typo'd check from reading green forever. An enum watch is the
+    # opposite kind of thing: it records a change and must never block a
+    # build. Putting it in `expectations` would mean adding a branch that
+    # always passes, i.e. exactly the vacuous check the fail-loud design
+    # exists to prevent. The ops agent reads this key; the pipeline does not.
+    enum_watch: tuple[dict, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -73,6 +82,7 @@ def load_contract(path: Path) -> Contract:
             for f in raw.get("schema", [])
         ),
         expectations=tuple(raw.get("expectations", [])),
+        enum_watch=tuple(raw.get("enum_watch", [])),
     )
 
 

@@ -38,6 +38,12 @@ A complete data platform, built end to end, small enough to read:
   feature independently recomputed by a second implementation on every training
   row.
 - **An agentic ops layer** — LangGraph, rules-first, dry-run by default, offline.
+  Schema changes are classified `breaking` / `renaming` / `widening` / `additive`
+  / `enum_drift`, with renames paired **by Iceberg field ID** so one rename is one
+  finding rather than a phantom drop plus a phantom add.
+- **Enum drift** on 7 categorical columns — new values are recorded and reported,
+  never used to block a build. Deliberately not the same mechanism as the
+  fail-closed `accepted_values` gate on `baseType`.
 - **17 data-quality monitors + 8 arrival checks** with persisted metric history
   and robust (median/MAD) baselines. 10 of the 17 are declared in YAML; the
   other 7 are column-type checks generated per contract field.
@@ -185,12 +191,12 @@ To see the whole story in order:
 
 ```bash
 uv run make all && uv run make agent          # clean: 0 findings
-uv run make drift-demo && uv run make agent   # after drift: 5 findings, 2 incidents
+uv run make drift-demo && uv run make agent   # after drift: 4 findings, 2 incidents
 ```
 
 Both transcripts below are from that exact sequence, on a warehouse with no
 `ops.monitor_results` history. Slot a `make monitor` in before `drift-demo` and
-the post-drift run reports **6** findings and 3 incidents, not 5 and 2: the
+the post-drift run reports **5** findings and 3 incidents, not 4 and 2: the
 persisted baseline of 250,000 added records lets `bronze_txn_row_count` breach
 as well, which the agent folds in as a `monitor_breach` finding on top of the
 volume anomaly its own sensor already found. That is the monitors working, not
@@ -438,7 +444,7 @@ sense ──▶ monitor ──▶ classify ──┬──▶ act ──▶ END
 |---|---|
 | `sense` | Reads Iceberg **metadata** — schema history, snapshot log, per-snapshot added-records, newest date. No data scan where metadata suffices. |
 | `monitor` | Runs the `src/ops` monitors and arrival SLAs; converts breaches into findings. |
-| `classify` | Severity per finding: `breaking` / `additive` / `benign`. **Rules first**; the optional Claude call handles only unmatched cases. |
+| `classify` | Severity per finding: `breaking` / `renaming` / `widening` / `additive` / `enum_drift` / `benign`. **Rules first**; the optional Claude call handles only unmatched cases. |
 | `act` | Writes `docs/incidents/<slug>.md` and would file a GitHub issue. **Dry-run by default.** |
 
 **Classification is rules-first because CI must never depend on a model call**
@@ -453,28 +459,78 @@ $ uv run make agent                       # clean lakehouse
 agent: as_of=2026-06-30 findings=0
 
 $ uv run make drift-demo && uv run make agent
-agent: as_of=2026-06-30 findings=5
-  [breaking] column 'checkNumber' declared in contract but absent from table
-  [additive] column 'check_reference' present in table but not declared in contract
+agent: as_of=2026-06-30 findings=4
+  [renaming] column 'checkNumber' was renamed to 'check_reference' (field id 20); the contract still declares the old name
   [additive] column 'merchantCategoryCode' present in table but not declared in contract
   [additive] column 'settlementDays' present in table but not declared in contract
   [breaking] latest snapshot added 5 rows, below 50% of trailing median 250,000
-  -> incident: bronze-yodlee_transactions_raw-checkNumber-3955ba01.md
-  -> DRY-RUN: would run `gh issue create ...` -> [breaking] schema_drift on bronze.yodlee_transactions_raw
+  -> incident: bronze-yodlee_transactions_raw-checkNumber-7b8d24a4.md
+  -> DRY-RUN: would run `gh issue create ...` -> [renaming] schema_drift on bronze.yodlee_transactions_raw
   -> incident: bronze-yodlee_transactions_raw-volume_anomaly-f0497e07.md
   -> DRY-RUN: would run `gh issue create ...` -> [breaking] volume_anomaly on bronze.yodlee_transactions_raw
 agent: dry-run (pass --execute to file GitHub issues)
 ```
 
-Five findings, **two** incident files — breaking only. Incident slugs are
+Four findings, **two** incident files — actionable only. Incident slugs are
 sha256-derived and therefore stable across processes, so re-running rewrites the
 same two files instead of accumulating duplicates. Committed examples are in
 [`docs/incidents/`](docs/incidents/).
 
-The rename classified as `breaking` is the right answer, not noise: Silver reads
-Bronze by name and the contract declares columns by name, so a rename *is* a drop
-to every consumer that selects it, even though Iceberg lost nothing. Storage
-fine, consumers broken — exactly what a human should review.
+### The rename used to be two findings, and that was the bug
+
+An earlier version of this agent reported the rename as **five** findings, not
+four:
+
+```
+  [breaking] column 'checkNumber' declared in contract but absent from table
+  [additive] column 'check_reference' present in table but not declared in contract
+```
+
+The reasoning behind `breaking` was not wrong as far as it went — Silver reads
+Bronze by name and the contract declares columns by name, so to a by-name
+consumer a rename really does read as a disappearance. Storage fine, consumers
+broken, worth a human's time. All of that still holds, which is why `renaming`
+is in `ACTIONABLE` and still files an incident.
+
+What was wrong is that **one event was reported as two unrelated ones**, and
+neither of them named what happened. A reader was told a column had vanished and,
+separately, that an unfamiliar column had appeared — and left to guess these were
+the same column. On the exact table whose headline property is that a rename
+costs nothing because the field ID does not move, the agent could not see the
+field ID: `schema_history()` returned `field_ids` and `observe()` discarded them.
+
+`build_rename_map` now groups every historical column name by field ID, so a name
+that has vanished from the latest schema while its ID is still present is a
+rename, not a drop — and `checkNumber` and `check_reference` are both field 20.
+Transitive renames (`a → b → c`) resolve to the current name in one hop, because
+the map is keyed on the ID rather than on consecutive pairs.
+
+**Pairing by field ID is not a stylistic preference over pairing by name or
+position, and the test suite has to prove that.** A rename does not move a
+column, so ordinal matching gets a plain rename right and looks correct; it
+breaks only when a column is deleted from the middle and everything after it
+shifts up, at which point it invents a rename that never happened *and* hides the
+real drop. A first draft of these tests supplied the rename map as a fixture
+rather than building it, and a deliberately planted position-matching mutant
+passed all 19 of them. The tests now build the map from schema history for a
+`{a:1, b:2, c:3} → {a:1, c_new:3}` evolution, where position and field ID give
+different answers, and both the position mutant and a name-similarity mutant fail
+against them — as does a real Iceberg table with a column deleted and another
+renamed in the same step.
+
+`widening` likewise stopped being a synonym for `additive`. A widened `int → long`
+and a brand-new column are both safe and neither pages anyone, but only one of
+them means the contract is behind on a column that already existed.
+
+**One honest gap in the demo**: `drift-demo`'s own `settlementDays int → long`
+step shows up above as `additive`, not `widening`. That is correct — `drift-demo`
+*adds* `settlementDays` before widening it, so the shipped contract never declared
+it and the agent has no narrower type to compare against. The `widening` class
+fires when a column the contract declares gets wider, which is covered against a
+real table by `test_real_widening_classifies_as_widening`. Declaring
+`settlementDays` in the contract to make the demo prettier would make the clean
+run report a phantom dropped column, so the demo stays as it is and the gap is
+stated instead.
 
 The incident file is careful about *which* consumers, and that took a fix. The
 generated reasoning used to end "its absence will fail the next Silver build",

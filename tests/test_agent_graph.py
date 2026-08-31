@@ -66,15 +66,29 @@ class _FakeEngine:
         contract = validator.load_contract(
             validator.CONTRACTS_DIR / "bronze_yodlee_transactions.yaml")
         self._columns = {f.name: f.type for f in contract.schema_fields}
+        self._enum_watch = contract.enum_watch
         if drop_column:
             self._columns.pop("baseType", None)
 
     def scan_arrow(self, ident, snapshot_id=None):
         import pyarrow as pa
-        return pa.table({
+        columns = {
             "id": pa.array([1, 2], pa.int64()),
             "transactionDate": pa.array(["2026-06-29", "2026-06-30"]),
-        })
+        }
+        # Watched enum columns are seeded from the contract's own registered
+        # values, for the same reason `_columns` is seeded from its `schema`:
+        # the fake stays clean *by construction*, so adding a watch to the
+        # contract cannot silently turn this stub into a table that is
+        # missing a monitored column. It is not silent, as it happens --
+        # `sensors._detect_enum_drift` reports a watch that read no values as
+        # `breaking` rather than passing it -- which is how this fixture's
+        # gap surfaced in the first place.
+        for watch in self._enum_watch:
+            known = list(watch.get("known_values", ()))
+            if watch["column"] in self._columns and known:
+                columns[watch["column"]] = pa.array([known[0], known[0]])
+        return pa.table(columns)
 
     def snapshots(self, ident):
         return [1, 2, 3]
