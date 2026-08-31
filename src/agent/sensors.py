@@ -48,6 +48,11 @@ from src import dates
 
 VOLUME_COLLAPSE_RATIO = 0.5  # below half the trailing median is an incident
 
+# Above this many distinct values a column is not an enum, and an enum watch
+# pointed at it is a misconfiguration. Reporting that is better than either
+# staying silent or emitting a finding carrying thousands of values.
+ENUM_CARDINALITY_LIMIT = 200
+
 
 @dataclass(frozen=True)
 class ObservedState:
@@ -58,6 +63,19 @@ class ObservedState:
     snapshot_count: int
     newest_date: date | None
     unparseable_date_count: int = 0
+    # Field IDs are the only evidence that distinguishes a rename from a drop
+    # plus an unrelated add. Iceberg keeps the ID stable across a rename --
+    # that is precisely why no data file is rewritten -- so an agent that
+    # reads names only cannot see the difference the storage layer is built
+    # around. `renames` maps every historical name to the column's CURRENT
+    # name, so a contract stuck at any past version resolves in one hop.
+    field_ids: dict[str, int] = field(default_factory=dict)
+    renames: dict[str, tuple[str, int]] = field(default_factory=dict)
+    enum_values: dict[str, list[str]] = field(default_factory=dict)
+    # Why a watched column produced no comparable values. Kept separate from
+    # `enum_values` so "could not evaluate" can never be mistaken for "no
+    # drift" -- the two must not share a representation.
+    enum_errors: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -68,7 +86,35 @@ class Finding:
     evidence: dict = field(default_factory=dict)
 
 
-def observe(engine, table_def, date_column: str | None = None) -> ObservedState:
+def build_rename_map(schema_versions: list[dict]) -> dict[str, tuple[str, int]]:
+    """Every past name of a still-present column -> (current name, field id).
+
+    Built by grouping names by field ID across the table's whole schema
+    history. Transitive renames (a -> b -> c) fall out for free: `a` and `b`
+    share field ID with `c`, so both map to `c` rather than to an
+    intermediate name that no longer exists either.
+
+    A field ID absent from the latest schema is a genuine drop and is
+    deliberately not in the map -- `detect()` must still call that breaking.
+    """
+    if not schema_versions:
+        return {}
+
+    current_by_id = {fid: name
+                     for name, fid in schema_versions[-1].get("field_ids", {}).items()}
+
+    names_by_id: dict[int, set[str]] = {}
+    for version in schema_versions:
+        for name, fid in version.get("field_ids", {}).items():
+            names_by_id.setdefault(fid, set()).add(name)
+
+    return {old: (current_by_id[fid], fid)
+            for fid, names in names_by_id.items() if fid in current_by_id
+            for old in names if old != current_by_id[fid]}
+
+
+def observe(engine, table_def, date_column: str | None = None,
+            enum_columns: tuple[str, ...] = ()) -> ObservedState:
     """Build an `ObservedState` for `table_def`.
 
     Columns, row count, and snapshot count are metadata-only: `columns`
@@ -90,19 +136,54 @@ def observe(engine, table_def, date_column: str | None = None) -> ObservedState:
     ident = table_def.name
 
     schema_versions = engine.schema_history(ident)
-    columns = schema_versions[-1]["columns"] if schema_versions else {}
+    latest = schema_versions[-1] if schema_versions else {}
+    columns = latest.get("columns", {})
+    field_ids = latest.get("field_ids", {})
+    renames = build_rename_map(schema_versions)
 
     details = engine.snapshot_details(ident)
     per_snapshot = engine.snapshot_row_counts(ident)
     row_count = details[-1]["total_records"] if details else 0
 
+    # One scan serves both the freshness read and the enum reads. Two would
+    # double the cost of the sensor the module docstring already apologises
+    # for; the scan happens only when something actually needs values.
+    wants_date = bool(date_column and date_column in columns)
+    arrow = engine.scan_arrow(ident) if wants_date or enum_columns else None
+
     newest = None
     unparseable = 0
-    if date_column and date_column in columns:
-        arrow = engine.scan_arrow(ident)
-        if date_column in arrow.column_names:
-            newest, unparseable = dates.max_parseable_date(
-                arrow.column(date_column).to_pylist())
+    if arrow is not None and wants_date and date_column in arrow.column_names:
+        newest, unparseable = dates.max_parseable_date(
+            arrow.column(date_column).to_pylist())
+
+    enum_values: dict[str, list[str]] = {}
+    enum_errors: dict[str, str] = {}
+    if arrow is not None:
+        for column in enum_columns:
+            if column not in arrow.column_names:
+                # Left out of the dict on purpose. `detect()` turns a watched
+                # column that produced no values into its own finding -- a
+                # watch on a column that isn't there must not read as "no
+                # drift", which is the empty-delta blind spot in miniature.
+                continue
+            try:
+                distinct = sorted({v for v in arrow.column(column).to_pylist()
+                                   if v is not None})
+            except TypeError:
+                # A watch aimed at a struct/list column: the values are
+                # unhashable and have no order, so there is nothing to diff.
+                # This crashed the sensor outright before -- the same shape as
+                # the unparseable-date crash, and the same reason it matters:
+                # a sensor that dies on bad input stops watching everything
+                # else on the table too, not just the column that is wrong.
+                enum_errors[column] = "not_comparable"
+                continue
+            # Truncated to one past the limit: enough for `detect()` to see
+            # the limit was exceeded, bounded enough that a watch mistakenly
+            # aimed at a merchant column cannot carry the whole cardinality
+            # into a finding, an incident file, and a report.
+            enum_values[column] = distinct[:ENUM_CARDINALITY_LIMIT + 1]
 
     return ObservedState(
         table=ident,
@@ -112,6 +193,10 @@ def observe(engine, table_def, date_column: str | None = None) -> ObservedState:
         snapshot_count=len(per_snapshot),
         newest_date=newest,
         unparseable_date_count=unparseable,
+        field_ids=field_ids,
+        renames=renames,
+        enum_values=enum_values,
+        enum_errors=enum_errors,
     )
 
 
@@ -122,8 +207,30 @@ def detect(state: ObservedState, contract, as_of: date,
     declared = {f.name: f.type for f in contract.schema_fields}
     observed = state.columns
 
+    # New names reached by a rename. Reported once, from the old name's side,
+    # and suppressed on the added-columns pass below -- otherwise the single
+    # event "this column was renamed" surfaces as two findings that look
+    # unrelated: a breaking drop and a benign add.
+    renamed_to: set[str] = set()
+
     for name, declared_type in declared.items():
         if name not in observed:
+            target = state.renames.get(name)
+            if target and target[0] in observed:
+                new_name, field_id = target
+                observed_type = observed[new_name]
+                compatible = _types_compatible(declared_type, observed_type)
+                renamed_to.add(new_name)
+                findings.append(Finding(
+                    "schema_drift", state.table,
+                    f"column '{name}' was renamed to '{new_name}' (field id "
+                    f"{field_id}); the contract still declares the old name",
+                    {"change": "renamed", "column": name,
+                     "renamed_to": new_name, "field_id": field_id,
+                     "declared_type": declared_type,
+                     "observed_type": observed_type,
+                     "type_compatible": compatible}))
+                continue
             findings.append(Finding(
                 "schema_drift", state.table,
                 f"column '{name}' declared in contract but absent from table",
@@ -136,7 +243,7 @@ def detect(state: ObservedState, contract, as_of: date,
                  "declared_type": declared_type, "observed_type": observed[name]}))
 
     for name in observed:
-        if name not in declared and not name.startswith("_"):
+        if name not in declared and not name.startswith("_") and name not in renamed_to:
             findings.append(Finding(
                 "schema_drift", state.table,
                 f"column '{name}' present in table but not declared in contract",
@@ -176,6 +283,100 @@ def detect(state: ObservedState, contract, as_of: date,
             "data_corruption", state.table,
             f"{state.unparseable_date_count} value(s){note} did not parse as a date",
             {"column": column, "unparseable_count": state.unparseable_date_count}))
+
+    findings += _detect_enum_drift(state, contract)
+
+    return findings
+
+
+def _detect_enum_drift(state: ObservedState, contract) -> list[Finding]:
+    """New values in a watched categorical column.
+
+    Deliberately separate from the contract's `accepted_values` expectation.
+    That one is a fail-closed gate: an unregistered value raises
+    `ContractViolation` and stops the build, which is right for a column the
+    pipeline's logic branches on (`baseType`). Most categorical columns are
+    not like that -- upstream adds a category and nothing downstream breaks,
+    but somebody needs to know. Blocking on those trains people to widen the
+    allowed list without looking; staying silent means the first anyone hears
+    of a new category is a mart that quietly under-counts.
+
+    So this reports and records, and never blocks.
+    """
+    findings: list[Finding] = []
+
+    for watch in getattr(contract, "enum_watch", ()):
+        column = watch["column"]
+        known = set(watch.get("known_values", ()))
+        observed = state.enum_values.get(column)
+
+        reason = state.enum_errors.get(column)
+        if reason is None and observed is not None:
+            # Defensive, for an ObservedState built some other way than by
+            # `observe()` -- a hand-built test state or a future caller. The
+            # unhashable case is guarded at the source too; duplicating it
+            # here costs one try block and removes a crash path entirely.
+            try:
+                set(observed)
+            except TypeError:
+                reason = "not_comparable"
+
+        if reason == "not_comparable":
+            findings.append(Finding(
+                "enum_drift", state.table,
+                f"enum watch on '{column}' cannot be evaluated: its values are "
+                f"not comparable (a struct or list column). The watch is "
+                f"misconfigured and this column is NOT being monitored",
+                {"column": column, "error": "not_comparable"}))
+            continue
+
+        if observed is not None and not observed:
+            # A column that exists but holds no values at all. `validator`
+            # already settled this question for `range` and `freshness`: a
+            # column with nothing in it is not a column that is in range, and
+            # it is not a column with no drift either. Reporting it clean is
+            # the empty-delta blind spot -- the check reads green precisely
+            # when the column has most obviously stopped working.
+            findings.append(Finding(
+                "enum_drift", state.table,
+                f"'{column}' is watched for enum drift but holds no values at "
+                f"all ({len(known)} registered value(s) and none present); a "
+                f"categorical column that has gone entirely NULL is a data "
+                f"problem, not a clean check",
+                {"column": column, "error": "no_values",
+                 "known_count": len(known)}))
+            continue
+
+        if observed is None:
+            # A watch that measured nothing is not a watch that found nothing.
+            findings.append(Finding(
+                "enum_drift", state.table,
+                f"enum watch declared on '{column}', but no values were read "
+                f"from that column -- it is absent from the table or was not "
+                f"collected, so this column is NOT being monitored",
+                {"column": column, "error": "column_absent"}))
+            continue
+
+        new_values = sorted(set(observed) - known)
+
+        if len(observed) > ENUM_CARDINALITY_LIMIT:
+            findings.append(Finding(
+                "enum_drift", state.table,
+                f"'{column}' holds more than {ENUM_CARDINALITY_LIMIT} distinct "
+                f"values, so it is not an enum; the watch is misconfigured and "
+                f"its drift result is meaningless",
+                {"column": column, "error": "cardinality_exceeded",
+                 "new_values": new_values[:ENUM_CARDINALITY_LIMIT],
+                 "distinct_at_least": len(observed)}))
+            continue
+
+        if new_values:
+            findings.append(Finding(
+                "enum_drift", state.table,
+                f"{len(new_values)} new value(s) in '{column}': "
+                f"{', '.join(new_values)}",
+                {"column": column, "new_values": new_values,
+                 "known_count": len(known), "distinct_observed": len(observed)}))
 
     return findings
 
