@@ -1,0 +1,24 @@
+# Daily OHLC prices, synthetic and spend-coupled (ADR-0004). No Bronze
+# contract and no monitors of its own today -- its arrival SLA is the check
+# that matters, because a price feed that stops arriving is invisible to every
+# row-level check on the rows that did arrive.
+name: stock_prices
+domain: market
+feed_type: dimension
+owner: data-platform
+ingest:
+  mode: batch
+
+layers:
+  silver:
+    table: silver.stock_prices
+
+monitors: []
+
+arrival:
+  # One price row per company per trading day, by construction.
+  - layer: silver
+    column: trade_date
+    calendar: trading
+    max_lag_periods: 3
+    min_rows_per_period: companies

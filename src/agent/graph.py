@@ -15,16 +15,24 @@ from typing import Any, TypedDict
 import pyarrow as pa
 from langgraph.graph import END, StateGraph
 
-from src import config
+from src import config, feeds
 from src.agent import actions, classifier, sensors
 from src.contracts import validator
 from src.lakehouse import schemas
 from src.ops import arrival, runner
 
-# (table_def, contract file under CONTRACTS_DIR, freshness column to observe)
-WATCHED = (
-    (schemas.BRONZE_TRANSACTIONS, "bronze_yodlee_transactions.yaml", "transactionDate"),
-)
+
+def watched_layers():
+    """Every feed layer that declares `agent_watch: true`, from `feeds/*.yaml`.
+
+    This was a hardcoded tuple of `(TableDef, contract file, freshness column)`.
+    Adding a second watched feed meant editing the agent, which is exactly the
+    coupling the per-feed configs exist to remove: the agent now knows how to
+    watch *a* feed, and the feed declares that it wants watching.
+    """
+    return tuple(
+        (feeds.table_def_for(layer.table), layer.contract, layer.freshness_column)
+        for feed in feeds.load_feeds() for layer in feed.watched_layers)
 # A severity is only worth having if it changes what the agent does.
 # `renaming` is actionable because the published contract now names a column
 # that does not exist -- nothing is lost, but a human has to record the
@@ -45,7 +53,7 @@ class AgentState(TypedDict, total=False):
 def sense_and_detect(state: AgentState) -> AgentState:
     engine = state["engine"]
     findings: list[sensors.Finding] = []
-    for table_def, contract_file, date_column in WATCHED:
+    for table_def, contract_file, date_column in watched_layers():
         contract = validator.load_contract(validator.CONTRACTS_DIR / contract_file)
         # The caller owns the contract, so it -- not the sensor -- resolves
         # which columns to read values for, the same way `date_column` works.

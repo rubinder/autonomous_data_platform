@@ -1,0 +1,57 @@
+# A derived feed, not an ingested one: the Gold mart joining transaction spend
+# to stock features. It gets a feed file of its own because it has exactly the
+# same operational needs as an ingested feed -- monitors, an arrival SLA, and
+# column types checked against a contract -- and because it belongs to neither
+# upstream feed cleanly.
+name: forecast_training_set
+domain: analytics
+feed_type: fact
+owner: data-platform
+ingest:
+  mode: batch
+
+layers:
+  gold:
+    table: gold.forecast_training_set
+    contract: gold_forecast_training_set.yaml
+    typed: true
+
+monitors:
+  # Same reasoning as the Silver monitors in feeds/yodlee_transactions.yaml:
+  # Gold marts are fully rebuilt (engine.overwrite) on every run, so row_count
+  # reads `count(*)` over the live table rather than per-snapshot added-records
+  # -- the latter would read every rebuild's full row count as newly added
+  # (both halves of an overwrite report `is_full_rebuild=True`; neither ever
+  # reports `operation="overwrite"`).
+  - name: gold_training_row_count
+    layer: gold
+    kind: row_count
+    severity: breaking
+    params: {breach_ratio: 0.5, warn_ratio: 0.8}
+    query: SELECT count(*) AS metric FROM t
+
+  # Deliberately a *rate*, not zero: the last FORECAST_HORIZON_DAYS rows per
+  # ticker legitimately have no forward return yet (`lead(adj_close, 5)` has
+  # nothing to lead into), and that count is fixed by the number of tickers and
+  # trading days -- it does not scale with N_TRANSACTIONS. At smoke scale
+  # (N_TRANSACTIONS=5000) roughly 59% of training rows have their *spend*
+  # features null because gold.daily_merchant_spend only covers a fraction of
+  # ticker-days, but that does not touch fwd_ret_5d, so this monitor is
+  # unaffected by that scale effect.
+  - name: gold_training_null_target_rate
+    layer: gold
+    kind: null_rate
+    column: fwd_ret_5d
+    severity: additive
+    params: {max_absolute: 0.05, breach_z: 4.0}
+    query: >
+      SELECT sum(CASE WHEN fwd_ret_5d IS NULL THEN 1 ELSE 0 END)
+             * 1.0 / nullif(count(*), 0) AS metric FROM t
+
+arrival:
+  # One training row per company per trading day, joined from the above.
+  - layer: gold
+    column: trade_date
+    calendar: trading
+    max_lag_periods: 5
+    min_rows_per_period: companies

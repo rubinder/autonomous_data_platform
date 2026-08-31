@@ -4,6 +4,9 @@ A monitor is a SQL query returning one column named `metric`, plus a rule for
 judging that number against its own history. Keeping the query in YAML means
 adding a check is a data change, not a code change -- which is what makes it
 plausible that an on-call engineer would actually add one.
+
+Definitions themselves live in `feeds/*.yaml` and are loaded by `src.feeds`;
+this module owns the *shape* of a monitor and the rules for judging one.
 """
 from __future__ import annotations
 
@@ -11,13 +14,8 @@ import math
 import statistics
 from dataclasses import dataclass
 from datetime import date
-from pathlib import Path
-
-import yaml
 
 from src import config
-
-MONITOR_DIR = config.REPO_ROOT / "monitors"
 
 
 @dataclass(frozen=True)
@@ -52,21 +50,6 @@ class MonitorResult:
     status: str          # ok | warn | breach
     detail: str
     run_at: date
-
-
-def load_monitors(path: Path | None = None) -> list[MonitorDef]:
-    directory = Path(path or MONITOR_DIR)
-    defs: list[MonitorDef] = []
-    for file in sorted(directory.glob("*.yaml")):
-        for raw in yaml.safe_load(file.read_text()) or []:
-            defs.append(MonitorDef(
-                name=raw["name"], table=raw["table"], kind=raw["kind"],
-                query=raw["query"], column=raw.get("column"),
-                severity=raw.get("severity", "additive"),
-                params=raw.get("params") or {},
-                tables=raw.get("tables") or None,
-                source=raw.get("source", "sql")))
-    return defs
 
 
 KINDS = frozenset({"row_count", "cardinality", "distribution_shift",

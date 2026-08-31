@@ -3,6 +3,7 @@ from datetime import date
 import pyarrow as pa
 import pytest
 
+from src import feeds
 from src.lakehouse import bronze, gold, schemas, silver
 from src.lakehouse import catalog as catalog_mod
 from src.lakehouse.engines.pyiceberg_engine import PyIcebergEngine
@@ -50,8 +51,8 @@ def engine(tmp_path_factory):
     return eng
 
 
-def test_monitor_definitions_load_from_yaml():
-    defs = monitors.load_monitors()
+def test_monitor_definitions_load_from_feed_configs():
+    defs = feeds.all_monitors()
     assert len(defs) >= 6
     kinds = {d.kind for d in defs}
     assert {"row_count", "null_rate", "distribution_shift",
@@ -112,18 +113,58 @@ def test_unknown_kind_raises_instead_of_reporting_ok():
                           params={"kind": "row_cont"})  # typo
 
 
-def test_a_typo_in_kind_surfaces_as_a_breach_not_a_pass(engine, tmp_path):
-    """`runner` must convert that raise into a visible breach, not a crash."""
+def test_a_typo_in_kind_is_rejected_at_config_load(tmp_path):
+    """Now caught earlier and more precisely than before.
+
+    A typo'd `kind` used to reach `evaluate()` and surface as a *breach*. That
+    was far better than passing, but it still says the wrong thing: a breach
+    means "your data is bad", and this means "your config is bad". The feed
+    loader rejects it up front, names the file and the monitor, and lists the
+    valid kinds.
+    """
     (tmp_path / "typo.yaml").write_text(
-        "- name: typo_monitor\n"
-        "  table: silver.transactions\n"
-        "  kind: row_cont\n"
-        "  query: SELECT count(*) AS metric FROM t\n")
-    results = runner.run_monitors(engine, as_of=date(2026, 6, 30),
-                                  monitor_dir=tmp_path)
+        "name: typo_feed\n"
+        "layers: {silver: {table: silver.transactions}}\n"
+        "monitors:\n"
+        "  - name: typo_monitor\n"
+        "    layer: silver\n"
+        "    kind: row_cont\n"
+        "    query: SELECT count(*) AS metric FROM t\n")
+    with pytest.raises(feeds.FeedConfigError) as exc:
+        feeds.load_feeds(tmp_path)
+    message = str(exc.value)
+    assert "typo_monitor" in message
+    assert "row_cont" in message
+    assert "row_count" in message      # tells you what it should have been
+
+
+def test_an_unknown_kind_reaching_the_runner_is_still_a_breach_not_a_crash(engine,
+                                                                            monkeypatch):
+    """The load-time guard above must not replace the runtime one.
+
+    A `MonitorDef` can be constructed without going through the loader, and one
+    bad monitor must never take down the other sixteen. This is the guarantee
+    the old YAML-typo test was really protecting; it is kept, exercised through
+    the path that can still reach it.
+    """
+    bad = monitors.MonitorDef(
+        name="typo_monitor", table="silver.transactions", kind="row_cont",
+        query="SELECT count(*) AS metric FROM t")
+    good = monitors.MonitorDef(
+        name="fine_monitor", table="silver.transactions", kind="row_count",
+        query="SELECT count(*) AS metric FROM t")
+
+    class _OneFeed:
+        name, monitors, typed_layers = "stub", (bad, good), ()
+
+    monkeypatch.setattr(feeds, "load_feeds", lambda d=None: [_OneFeed()])
+
+    results = runner.run_monitors(engine, as_of=date(2026, 6, 30))
     typo = next(r for r in results if r.monitor == "typo_monitor")
     assert typo.status == "breach"
     assert "unknown monitor kind" in typo.detail
+    # the good one still ran
+    assert next(r for r in results if r.monitor == "fine_monitor").status != "breach"
 
 
 def test_column_type_results_are_stamped_with_the_runs_as_of(engine):

@@ -1,0 +1,141 @@
+# The financial transaction feed: Yodlee-style webhook JSON, landed
+# source-faithful in Bronze and conformed in Silver.
+#
+# Everything about this feed that is not its Iceberg schema lives here. Before
+# this file, adding a feed meant editing `monitors/<layer>.yaml`,
+# `graph.py:WATCHED`, `arrival.py:ARRIVAL_SLAS` and `runner.py:TYPED_TABLES` --
+# four places, three of them Python, organised by *layer* rather than by feed.
+name: yodlee_transactions
+domain: financial
+feed_type: fact
+owner: data-platform
+ingest:
+  mode: batch
+
+layers:
+  bronze:
+    table: bronze.yodlee_transactions_raw
+    contract: bronze_yodlee_transactions.yaml
+    # The column the ops agent reads for freshness. Named here rather than in
+    # the agent so the agent has no per-feed knowledge at all.
+    freshness_column: transactionDate
+    # The agent senses this layer: schema drift, enum drift, volume, staleness.
+    agent_watch: true
+  silver:
+    table: silver.transactions
+    contract: silver_transactions.yaml
+    # Generate a column-type monitor per contract field on this layer.
+    typed: true
+
+monitors:
+  # Bronze is append-only, which is exactly the case where cumulative
+  # `count(*)` is the WRONG volume signal (the opposite of the Silver and Gold
+  # monitors below, which are full rebuilds every run and use `count(*)`
+  # deliberately). Cumulative size barely moves when an upstream feed
+  # collapses: five batches of 1,000 rows followed by a batch of 1 row still
+  # reports "5001 vs baseline 3000" on a `count(*)` monitor -- a near-total
+  # outage stays invisible. `source: snapshot_added` instead reads
+  # `engine.snapshot_details()`'s `added_records` for the latest non-rebuild
+  # snapshot, i.e. the size of the batch that just landed. Bronze's snapshots
+  # are always `operation="append"` with `is_full_rebuild=False`, so this is
+  # an unambiguous per-batch signal. `query` documents the *shape* the metric
+  # would take, for readability, but the source keys off `source:
+  # snapshot_added` and `query` is not executed for this monitor.
+  - name: bronze_txn_row_count
+    layer: bronze
+    kind: row_count
+    severity: breaking
+    source: snapshot_added
+    params: {breach_ratio: 0.5, warn_ratio: 0.8}
+    query: >
+      -- not executed: metric = added_records of the latest non-rebuild
+      -- snapshot, from engine.snapshot_details(), not a SQL aggregate.
+
+  - name: bronze_txn_null_id_rate
+    layer: bronze
+    kind: null_rate
+    column: id
+    severity: breaking
+    params: {max_absolute: 0}
+    query: >
+      SELECT sum(CASE WHEN id IS NULL THEN 1 ELSE 0 END)
+             * 1.0 / nullif(count(*), 0) AS metric FROM t
+
+  # Row-count monitors on Silver read `count(*)` over the *current* live table,
+  # not per-snapshot added-records. Silver is fully rebuilt (engine.overwrite)
+  # on every run: PyIceberg 0.11.1 commits an overwrite as a `delete` snapshot
+  # followed by a plain `append` snapshot, and both halves report
+  # `is_full_rebuild=True` via `engine.snapshot_details()` -- there is no
+  # snapshot whose `operation` reads "overwrite". A monitor built on
+  # added-records would therefore read *every* rebuild's entire row count as
+  # newly added, which is not a spike, it is the whole table. A full-scan
+  # `count(*)` sidesteps that trap entirely: it measures current volume, which
+  # is the number that actually matters for a table that never grows
+  # incrementally.
+  - name: silver_txn_row_count
+    layer: silver
+    kind: row_count
+    severity: breaking
+    params: {breach_ratio: 0.5, warn_ratio: 0.8}
+    query: SELECT count(*) AS metric FROM t
+
+  - name: silver_txn_duplicate_ids
+    layer: silver
+    kind: duplicate_rate
+    severity: breaking
+    params: {max_absolute: 0}
+    query: SELECT count(*) - count(DISTINCT id) AS metric FROM t
+
+  - name: silver_txn_null_merchant_rate
+    layer: silver
+    kind: null_rate
+    column: merchant_normalized
+    severity: additive
+    params: {max_absolute: 0.05, breach_z: 4.0}
+    query: >
+      SELECT sum(CASE WHEN merchant_normalized IS NULL THEN 1 ELSE 0 END)
+             * 1.0 / nullif(count(*), 0) AS metric FROM t
+
+  - name: silver_txn_mean_abs_amount
+    layer: silver
+    kind: distribution_shift
+    column: signed_amount
+    severity: additive
+    params: {breach_z: 4.0, warn_z: 3.0}
+    query: SELECT avg(abs(signed_amount)) AS metric FROM t
+
+  - name: silver_txn_account_cardinality
+    layer: silver
+    kind: cardinality
+    column: account_id
+    severity: additive
+    params: {breach_ratio: 0.5, warn_ratio: 0.8}
+    query: SELECT count(DISTINCT account_id) AS metric FROM t
+
+  # The genuine quarantine rate needs both the clean and the quarantined table
+  # in one query -- `tables` binds `silver.transactions_quarantine` as a second
+  # alias `q` alongside the implicit `t` (-> the monitor's `layer` table).
+  # Before this, the query was a placeholder (`SELECT 0.0 ... LIMIT 1`) that
+  # could never fire; it read as passing coverage of the quarantine path on
+  # every run while checking nothing.
+  - name: silver_txn_quarantine_rate
+    layer: silver
+    kind: null_rate
+    severity: breaking
+    params: {max_absolute: 0.01}
+    tables: {q: silver.transactions_quarantine}
+    query: >
+      SELECT (SELECT count(*) FROM q) * 1.0
+             / nullif((SELECT count(*) FROM t) + (SELECT count(*) FROM q), 0)
+             AS metric
+
+arrival:
+  # silver.transactions has no structural floor -- transactions per day is a
+  # volume, not a shape, and it varies with N_TRANSACTIONS. Thinness there is
+  # what the volume monitors above measure against a trailing median; there is
+  # nothing honest to assert here, so nothing is.
+  - layer: silver
+    column: txn_date
+    calendar: trading
+    max_lag_periods: 3
+    min_rows_per_period: null
