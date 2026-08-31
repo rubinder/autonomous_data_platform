@@ -81,6 +81,22 @@ def classify(finding: Finding) -> tuple[str, str]:
                 "column produced no values. Until this is fixed, new values in "
                 "it will go unnoticed while the check reports clean.")
 
+        if error == "not_comparable":
+            return "benign", (
+                f"The enum watch on '{column}' points at a struct or list "
+                "column, whose values cannot be diffed as an enum. No "
+                "conclusion about drift can be drawn from it; remove the "
+                "watch. (It used to crash the sensor, taking every other "
+                "check on the table down with it.)")
+
+        if error == "no_values":
+            return "breaking", (
+                f"'{column}' is watched as a categorical column but holds no "
+                f"values at all, against {finding.evidence.get('known_count')} "
+                "registered. A column that has gone entirely NULL reports zero "
+                "new values, so the enum check reads clean at exactly the "
+                "moment the column stopped working.")
+
         if error == "cardinality_exceeded":
             return "benign", (
                 f"'{column}' is not a categorical column "

@@ -88,6 +88,39 @@ been. A watch on a column with more than `ENUM_CARDINALITY_LIMIT` (200) distinct
 values reports itself misconfigured rather than emitting a finding carrying the
 whole cardinality.
 
+## Review round: two defects the tests did not reach
+
+Both were found by probing the shipped code adversarially rather than by
+re-reading the diff, and both are the same shape as bugs this repository has
+already fixed once.
+
+**1. A watch on a struct column crashed the sensor.**
+`sorted({...})` over a struct column's values raises
+`TypeError: unhashable type: 'dict'`, out of `observe()` *and* out of
+`detect()`. Bronze has three struct columns (`amount`, `runningBalance`,
+`merchant`), so this is a config mistake a human could plausibly make — and the
+consequence was not a bad reading on one column but a dead sensor for the whole
+table, exactly the failure the unparseable-date guard exists to prevent:
+
+> a monitor that crashes on bad data stops monitoring at exactly the moment
+> something has gone wrong
+
+Guarded at the source, and again in `detect()` for a hand-built `ObservedState`.
+An unevaluable watch now reports `not_comparable` and classifies `benign`
+("remove the watch"), and the reason lives in `enum_errors`, deliberately
+*separate* from `enum_values`, so "could not evaluate" and "no drift" can never
+share a representation.
+
+**2. An entirely-NULL watched column reported clean.**
+Zero values means zero *new* values, so the naive diff reads green precisely when
+a categorical column has stopped being populated. `validator._evaluate` had
+already settled this question in the other direction for both `range` ("a column
+with nothing in it is not a column that is in range") and `freshness`; the enum
+watch now agrees with them and classifies `no_values` as `breaking`.
+
+Neither fires on real data: the clean run is still 0 findings with all seven
+watches active.
+
 ## Known gap, stated rather than hidden
 
 `drift-demo`'s `settlementDays int → long` step reports as `additive`, not

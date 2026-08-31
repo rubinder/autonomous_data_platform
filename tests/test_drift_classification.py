@@ -408,3 +408,65 @@ def test_rename_map_survives_a_real_drop_and_rename_in_one_step(engine):
     assert classifier.classify(
         next(f for f in findings
              if f.evidence.get("column") == "detailCategoryId"))[0] == "breaking"
+
+
+# --------------------------------------------------------------------------
+# Watches that cannot be evaluated must say so, never read clean
+# --------------------------------------------------------------------------
+
+def test_watch_on_a_struct_column_reports_instead_of_crashing():
+    """Regression: this raised `TypeError: unhashable type: 'dict'` out of
+    `detect()`. A sensor that dies on one bad watch stops watching the whole
+    table -- the same failure the unparseable-date guard exists to prevent."""
+    contract = _contract([("amount", "struct")],
+                         [{"column": "amount", "known_values": []}])
+    state = _state(columns={"amount": "struct"}, field_ids={"amount": 6},
+                   renames={}, enum_values={"amount": [{"a": 1}, {"b": 2}]})
+
+    finding = next(f for f in sensors.detect(state, contract, date(2026, 6, 30), [])
+                   if f.kind == "enum_drift")
+
+    assert finding.evidence["error"] == "not_comparable"
+    assert classifier.classify(finding)[0] == "benign"
+
+
+def test_observe_does_not_crash_collecting_a_struct_column(engine):
+    """The same guard at the source, against a real table. `amount` is a
+    struct in Bronze, so this is a config mistake a human could plausibly
+    make."""
+    state = sensors.observe(engine, schemas.BRONZE_TRANSACTIONS,
+                            "transactionDate", enum_columns=("amount",))
+
+    assert state.enum_errors.get("amount") == "not_comparable"
+    assert "amount" not in state.enum_values
+    # and the rest of the observation still happened
+    assert state.newest_date is not None
+    assert state.row_count > 0
+
+
+def test_an_entirely_null_watched_column_is_not_reported_clean():
+    """The empty-delta blind spot. Zero values means zero *new* values, so a
+    naive diff reads green exactly when the column has stopped working.
+    `validator` already settled this for `range` and `freshness`."""
+    contract = _contract([("category", "string")],
+                         [{"column": "category", "known_values": ["A", "B"]}])
+    state = _state(columns={"category": "string"}, field_ids={"category": 12},
+                   renames={}, enum_values={"category": []})
+
+    findings = [f for f in sensors.detect(state, contract, date(2026, 6, 30), [])
+                if f.kind == "enum_drift"]
+
+    assert len(findings) == 1
+    assert findings[0].evidence["error"] == "no_values"
+    assert classifier.classify(findings[0])[0] == "breaking"
+
+
+def test_a_populated_column_with_no_new_values_stays_silent():
+    """The guard above must not fire on the healthy case -- otherwise it is
+    just noise on every run."""
+    contract = _contract([("category", "string")],
+                         [{"column": "category", "known_values": ["A", "B"]}])
+    state = _state(columns={"category": "string"}, field_ids={"category": 12},
+                   renames={}, enum_values={"category": ["A"]})
+    assert not [f for f in sensors.detect(state, contract, date(2026, 6, 30), [])
+                if f.kind == "enum_drift"]

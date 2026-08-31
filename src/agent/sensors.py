@@ -72,6 +72,10 @@ class ObservedState:
     field_ids: dict[str, int] = field(default_factory=dict)
     renames: dict[str, tuple[str, int]] = field(default_factory=dict)
     enum_values: dict[str, list[str]] = field(default_factory=dict)
+    # Why a watched column produced no comparable values. Kept separate from
+    # `enum_values` so "could not evaluate" can never be mistaken for "no
+    # drift" -- the two must not share a representation.
+    enum_errors: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -154,6 +158,7 @@ def observe(engine, table_def, date_column: str | None = None,
             arrow.column(date_column).to_pylist())
 
     enum_values: dict[str, list[str]] = {}
+    enum_errors: dict[str, str] = {}
     if arrow is not None:
         for column in enum_columns:
             if column not in arrow.column_names:
@@ -162,8 +167,18 @@ def observe(engine, table_def, date_column: str | None = None,
                 # watch on a column that isn't there must not read as "no
                 # drift", which is the empty-delta blind spot in miniature.
                 continue
-            distinct = sorted({v for v in arrow.column(column).to_pylist()
-                               if v is not None})
+            try:
+                distinct = sorted({v for v in arrow.column(column).to_pylist()
+                                   if v is not None})
+            except TypeError:
+                # A watch aimed at a struct/list column: the values are
+                # unhashable and have no order, so there is nothing to diff.
+                # This crashed the sensor outright before -- the same shape as
+                # the unparseable-date crash, and the same reason it matters:
+                # a sensor that dies on bad input stops watching everything
+                # else on the table too, not just the column that is wrong.
+                enum_errors[column] = "not_comparable"
+                continue
             # Truncated to one past the limit: enough for `detect()` to see
             # the limit was exceeded, bounded enough that a watch mistakenly
             # aimed at a merchant column cannot carry the whole cardinality
@@ -181,6 +196,7 @@ def observe(engine, table_def, date_column: str | None = None,
         field_ids=field_ids,
         renames=renames,
         enum_values=enum_values,
+        enum_errors=enum_errors,
     )
 
 
@@ -293,6 +309,43 @@ def _detect_enum_drift(state: ObservedState, contract) -> list[Finding]:
         column = watch["column"]
         known = set(watch.get("known_values", ()))
         observed = state.enum_values.get(column)
+
+        reason = state.enum_errors.get(column)
+        if reason is None and observed is not None:
+            # Defensive, for an ObservedState built some other way than by
+            # `observe()` -- a hand-built test state or a future caller. The
+            # unhashable case is guarded at the source too; duplicating it
+            # here costs one try block and removes a crash path entirely.
+            try:
+                set(observed)
+            except TypeError:
+                reason = "not_comparable"
+
+        if reason == "not_comparable":
+            findings.append(Finding(
+                "enum_drift", state.table,
+                f"enum watch on '{column}' cannot be evaluated: its values are "
+                f"not comparable (a struct or list column). The watch is "
+                f"misconfigured and this column is NOT being monitored",
+                {"column": column, "error": "not_comparable"}))
+            continue
+
+        if observed is not None and not observed:
+            # A column that exists but holds no values at all. `validator`
+            # already settled this question for `range` and `freshness`: a
+            # column with nothing in it is not a column that is in range, and
+            # it is not a column with no drift either. Reporting it clean is
+            # the empty-delta blind spot -- the check reads green precisely
+            # when the column has most obviously stopped working.
+            findings.append(Finding(
+                "enum_drift", state.table,
+                f"'{column}' is watched for enum drift but holds no values at "
+                f"all ({len(known)} registered value(s) and none present); a "
+                f"categorical column that has gone entirely NULL is a data "
+                f"problem, not a clean check",
+                {"column": column, "error": "no_values",
+                 "known_count": len(known)}))
+            continue
 
         if observed is None:
             # A watch that measured nothing is not a watch that found nothing.
