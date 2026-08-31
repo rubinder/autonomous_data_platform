@@ -274,3 +274,82 @@ def test_a_stream_feed_is_accepted_today_even_though_nothing_streams_yet():
     """`ingest.mode: stream` validates now so the streaming work (#4) adds a
     reader, not a config schema change."""
     assert "stream" in feeds.VALID_INGEST_MODES
+
+
+# --------------------------------------------------------------------------
+# Config that is *absent* must not read as config that is *clean*
+# --------------------------------------------------------------------------
+
+def test_an_empty_feeds_directory_is_an_error_not_zero_checks(tmp_path):
+    """The failure this codebase keeps having to close, one level up.
+
+    Every monitor, arrival SLA and agent watch is declared in feeds/*.yaml.
+    An empty directory would make `make monitor` print "0 checks -- 0 breach,
+    0 warn" and exit 0: a platform reporting perfect health because it is
+    looking at nothing at all.
+    """
+    with pytest.raises(feeds.FeedConfigError) as exc:
+        feeds.load_feeds(tmp_path)
+    assert "no feed configs found" in str(exc.value)
+    assert "checking nothing" in str(exc.value)
+
+
+def test_a_missing_feeds_directory_is_an_error(tmp_path):
+    with pytest.raises(feeds.FeedConfigError, match="no feed configs found"):
+        feeds.load_feeds(tmp_path / "does_not_exist")
+
+
+def test_two_feeds_typing_the_same_table_are_rejected(tmp_path):
+    """Generated column-type monitors are named `<table>_type_<field>`, so two
+    feeds typing one table mint identical monitor names -- the same baseline
+    corruption the duplicate-name check prevents, arriving by a route that
+    check cannot see, because generated names never appear in `feed.monitors`.
+    """
+    body = """
+name: {name}
+layers:
+  silver:
+    table: silver.transactions
+    contract: silver_transactions.yaml
+    typed: true
+"""
+    _write(tmp_path, "a", body.format(name="feed_a"))
+    _write(tmp_path, "b", body.format(name="feed_b"))
+    with pytest.raises(feeds.FeedConfigError) as exc:
+        feeds.load_feeds(tmp_path)
+    assert "silver.transactions" in str(exc.value)
+    assert "one baseline series" in str(exc.value)
+
+
+def test_two_feeds_watching_the_same_table_are_rejected(tmp_path):
+    body = """
+name: {name}
+layers:
+  bronze:
+    table: bronze.yodlee_transactions_raw
+    contract: bronze_yodlee_transactions.yaml
+    agent_watch: true
+"""
+    _write(tmp_path, "a", body.format(name="feed_a"))
+    _write(tmp_path, "b", body.format(name="feed_b"))
+    with pytest.raises(feeds.FeedConfigError, match="watched by both"):
+        feeds.load_feeds(tmp_path)
+
+
+def test_a_tables_alias_naming_an_unknown_table_is_rejected(tmp_path):
+    """Would otherwise fail at query time and be swallowed into a breach --
+    visible, but reported as a data problem when it is a config typo."""
+    _write(tmp_path, "bad", """
+name: demo
+layers: {silver: {table: silver.transactions}}
+monitors:
+  - name: m
+    layer: silver
+    kind: row_count
+    tables: {q: silver.does_not_exist}
+    query: SELECT count(*) AS metric FROM q
+""")
+    with pytest.raises(feeds.FeedConfigError) as exc:
+        feeds.load_feeds(tmp_path)
+    assert "alias 'q'" in str(exc.value)
+    assert "silver.does_not_exist" in str(exc.value)

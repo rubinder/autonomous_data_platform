@@ -105,3 +105,35 @@ in. A test renders the same findings in two different orders and compares.
 Worth stating plainly: this defect existed before the migration and was invisible
 because nothing had reordered the checks yet. The migration did not cause it; it
 revealed it.
+
+
+## Review round: absent config must not read as clean config
+
+Probing the shipped loader found the same failure this repository keeps closing,
+one level up from where it had been closed before.
+
+**An empty or missing `feeds/` directory loaded zero feeds, silently.** Every
+monitor, arrival SLA and agent watch is now declared there, so a deleted or
+mistyped directory made `make monitor` print `0 checks -- 0 breach, 0 warn` and
+exit **0**. A platform reporting perfect health because it was looking at
+nothing at all. Centralising the config concentrated this risk: before, losing
+one `monitors/<layer>.yaml` lost a third of the checks; now, losing the
+directory loses all of them *and* the arrival SLAs *and* the agent's watch list.
+`load_feeds` raises.
+
+**Two feeds typing the same table minted colliding monitor names.** Column-type
+monitors are generated as `f"{table}_type_{field}"`, so two feeds with
+`typed: true` on one table produce identical names -- exactly the baseline
+corruption the duplicate-monitor-name check exists to prevent, arriving by a
+route that check could not see, because generated names never appear in
+`feed.monitors`. Same for two feeds watching one table, which would raise every
+finding on it twice.
+
+**A `tables:` alias naming an unknown table was unvalidated.** It would have
+failed at query time and been swallowed into a breach by `run_monitors`'s broad
+except: visible, but reported as a data problem when it is a config typo.
+
+Two feeds merely *naming* the same table stays legal -- a shared dimension is a
+real thing. Only the collisions that corrupt something are rejected.
+
+Both golden captures were re-run after the hardening and still match.

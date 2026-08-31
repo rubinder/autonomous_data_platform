@@ -2,7 +2,7 @@
 
 **Severity:** renaming
 
-**Detected as of:** 2026-07-01
+**Detected as of:** 2026-06-30
 
 ## What was observed
 

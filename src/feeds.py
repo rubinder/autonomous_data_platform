@@ -152,6 +152,16 @@ def _parse_monitors(raw: dict, layers: dict[str, LayerDef],
             raise FeedConfigError(
                 f"{spot}: unknown kind '{kind}' "
                 f"(expected one of {', '.join(sorted(KINDS))})")
+        for alias, table in (entry.get("tables") or {}).items():
+            # Would otherwise fail at query time and be swallowed into a
+            # breach by `run_monitors`'s broad except -- visible, but reported
+            # as a data problem when it is a config typo.
+            try:
+                table_def_for(table)
+            except FeedConfigError as exc:
+                raise FeedConfigError(
+                    f"{spot}: tables alias '{alias}' -> {exc}") from None
+
         out.append(MonitorDef(
             name=name, table=layers[layer].table, kind=kind,
             query=_require(entry, "query", spot), column=entry.get("column"),
@@ -231,18 +241,61 @@ def load_feeds(directory: Path | None = None) -> list[FeedDef]:
     one baseline series -- so it is rejected here rather than discovered later
     as an anomaly that will not reproduce.
     """
-    feeds = [load_feed(p) for p in sorted(Path(directory or FEED_DIR).glob("*.yaml"))]
+    root = Path(directory or FEED_DIR)
+    paths = sorted(root.glob("*.yaml"))
 
-    seen: dict[str, str] = {}
+    # No feeds is not "nothing to check", it is "the config is gone". Without
+    # this, deleting or mistyping the directory makes `make monitor` print
+    # "0 checks -- 0 breach, 0 warn" and exit 0: a platform reporting perfect
+    # health because it is looking at nothing. Same species as the `SELECT 0.0`
+    # quarantine monitor and the range check that passed on an all-NULL column.
+    if not paths:
+        raise FeedConfigError(
+            f"no feed configs found in {root}/ -- every monitor, arrival SLA "
+            "and agent watch is declared in feeds/*.yaml, so an empty "
+            "directory means zero checks would run and the platform would "
+            "report clean while checking nothing")
+
+    feeds = [load_feed(p) for p in paths]
+
+    monitor_owner: dict[str, str] = {}
+    typed_owner: dict[str, str] = {}
+    watch_owner: dict[str, str] = {}
+
     for feed in feeds:
         for monitor in feed.monitors:
-            if monitor.name in seen:
+            if monitor.name in monitor_owner:
                 raise FeedConfigError(
                     f"duplicate monitor name '{monitor.name}' in feeds "
-                    f"'{seen[monitor.name]}' and '{feed.name}'; monitor names "
-                    "are the key that joins a definition to its persisted "
-                    "baseline history and must be unique across all feeds")
-            seen[monitor.name] = feed.name
+                    f"'{monitor_owner[monitor.name]}' and '{feed.name}'; "
+                    "monitor names are the key that joins a definition to its "
+                    "persisted baseline history and must be unique across all "
+                    "feeds")
+            monitor_owner[monitor.name] = feed.name
+
+        # Column-type monitors are generated as `f"{table}_type_{field}"`, so
+        # two feeds typing the same table mint identically-named monitors --
+        # the same baseline corruption the check above prevents, arriving by a
+        # route that check cannot see, because generated names never appear in
+        # `feed.monitors`.
+        for layer in feed.typed_layers:
+            if layer.table in typed_owner:
+                raise FeedConfigError(
+                    f"table '{layer.table}' is declared `typed: true` by both "
+                    f"'{typed_owner[layer.table]}' and '{feed.name}'; the "
+                    "generated column-type monitors would share names and "
+                    "interleave two measurements into one baseline series")
+            typed_owner[layer.table] = feed.name
+
+        for layer in feed.watched_layers:
+            if layer.table in watch_owner:
+                raise FeedConfigError(
+                    f"table '{layer.table}' is watched by both "
+                    f"'{watch_owner[layer.table]}' and '{feed.name}'; the "
+                    "agent would sense it twice and raise every finding on it "
+                    "twice")
+            watch_owner[layer.table] = feed.name
+
     return feeds
 
 
